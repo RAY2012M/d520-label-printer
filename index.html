@@ -322,7 +322,7 @@ svg{fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-l
             <label class="f">Printer language
               <select id="proto"><option value="tspl">TSPL (D520)</option><option value="escpos">ESC/POS raster</option><option value="phomemo">Phomemo ESC/POS</option></select></label>
             <label class="f">Image data
-              <select id="enc"><option value="lzo">Compressed (like the Phomemo app)</option><option value="plain">Plain</option></select></label>
+              <select id="enc"><option value="plain">Plain (works)</option><option value="lzo">Compressed (test)</option></select></label>
             <label class="f">Paper type
               <select id="gap"><option value="gap">Labels with gaps</option><option value="cont">Continuous roll</option><option value="mark">Black mark</option></select></label>
             <label class="f">Gap between labels (mm)<input id="gapmm" type="number" step="0.5" min="0" max="10" value="3"></label>
@@ -382,8 +382,8 @@ let nextId = 1;
 
 /* ---------- settings ---------- */
 const S_IDS = ['size','copies','cw','ch','density','thresh','mode','fit','autorot','trim','proto','gap','gapmm','margin','speed','chunk','delay','headDots','flip','invert','detect','rate','enc'];
-function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set16')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
-function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set16',JSON.stringify(s)); }catch(e){} }
+function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set17')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
+function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set17',JSON.stringify(s)); }catch(e){} }
 function num(id,d){ const v=parseFloat($(id).value); return isFinite(v)?v:d; }
 function cfg(){
   let w,h; const sz=$('size').value;
@@ -657,7 +657,8 @@ async function findChannel(gatt){
   return pick||cands[0]||null;
 }
 $('connectBtn').onclick=async()=>{
-  if(dev&&dev.gatt&&dev.gatt.connected){ dev.gatt.disconnect(); return; }
+  manualDisc=false;
+  if(dev&&dev.gatt&&dev.gatt.connected){ manualDisc=true; dev.gatt.disconnect(); return; }
   if(!hasBt){ $('noBt').hidden=false; return; }
   showErr('');
   try{
@@ -665,7 +666,17 @@ $('connectBtn').onclick=async()=>{
     chip('busy','Choose your D520…');
     dev=await pickDevice();
     log('Picked: '+(dev.name||'(no name)')+' '+(dev.id||''));
-    dev.addEventListener('gattserverdisconnected',()=>{ for(const k in credits){ delete credits[k]; delete creditSeen[k]; } wchar=null; chip('','Not connected'); log('Disconnected'); });
+    dev.addEventListener('gattserverdisconnected',()=>{ for(const k in credits){ delete credits[k]; delete creditSeen[k]; } wchar=null; if(autoDisc){ autoDisc=false; chip('on',(dev.name||'D520')+' ready'); log('Link closed after the print (stops repeats)'); } else { chip('','Not connected'); log('Disconnected'); } });
+    await attach();
+  }catch(e){
+    log('Connect failed: '+e.name+' '+e.message);
+    if(e.name==='NotFoundError'&&/cancel/i.test(e.message)){ chip('','Not connected'); return; }
+    chip('','Connect failed');
+    showErr((framed?'Bluetooth is blocked inside this frame. Open https://ray2012m.github.io/d520-label-printer/ in Bluefy. ':'')+'Could not connect: '+(e.message||e.name));
+  }
+};
+let manualDisc=false;
+async function attach(){
     chip('busy','Connecting to '+(dev.name||'printer')+'…');
     let gatt; for(let k=0;k<3;k++){ try{ gatt=await dev.gatt.connect(); break; }catch(e){ log('connect try '+(k+1)+': '+e.message); if(k===2) throw e; await sleep(800); } }
     wchar=await findChannel(gatt);
@@ -676,14 +687,7 @@ $('connectBtn').onclick=async()=>{
     { const sv=wchar.service.uuid.toUpperCase(); log('Printer link: '+(creditSeen[sv]?'on ('+(credits[sv]||0)+' packets ready, '+(pktSize[sv]||'?')+'-byte packets)':'not seen yet')); }
     log('Using '+wchar.uuid+(noResp?' (fast)':' (with response)'));
     chip('on',(dev.name||'Printer')+' connected');
-    { let cal=false; try{ cal=localStorage.getItem('d520cal')==='1'; }catch(e){} if(!cal) showErr('First time only: tap the gear, then Set up paper. The printer measures your labels so it stops after each one.'); }
-  }catch(e){
-    log('Connect failed: '+e.name+' '+e.message);
-    if(e.name==='NotFoundError'&&/cancel/i.test(e.message)){ chip('','Not connected'); return; }
-    chip('','Connect failed');
-    showErr((framed?'Bluetooth is blocked inside this frame. Open https://ray2012m.github.io/d520-label-printer/ in Bluefy. ':'')+'Could not connect: '+(e.message||e.name));
-  }
-};
+}
 let pipeOK=null; // can this browser queue several Bluetooth writes at once?
 // The D520 tells the app how many packets it is ready for ("01 nn" = nn more packets) and the packet size ("02 lo hi").
 const credits={}, pktSize={}, creditSeen={}; let creditWake=null;
@@ -695,13 +699,17 @@ function onNotify(ev){
   log('printer says: '+[...v.subarray(0,24)].map(b=>b.toString(16).padStart(2,'0')).join(' ')+(v.length>24?' …':'')+'  "'+asText+'"');
   if(/Cmd error/.test(asText)) lastPrinterError=asText.trim();
   if(/GETPAPER:NO/.test(asText)){ paperNo++; showErr('The printer says it sees no paper. Check the labels sit under the sensor guide, then tap the gear and Set up paper again.'); }
+  if(/GETPRINTING:DONE/.test(asText)&&expectPrints>0){
+    doneCount++;
+    if(doneCount>=expectPrints){ log(`Printer finished ${doneCount} label(s); closing the link so nothing repeats`); expectPrints=0; autoDisc=true; setTimeout(()=>{ try{ dev&&dev.gatt.connected&&dev.gatt.disconnect(); }catch(e){} },150); }
+  }
   if(/GETPRINTING:DOING/.test(asText)&&expectPrints>0){
     startedPrints++;
-    if(startedPrints>expectPrints){ log(`Printer started label ${startedPrints} but only ${expectPrints} was asked for. Stopping it.`); stopPrinter(); expectPrints=0;
+    if(startedPrints>expectPrints){ log(`Printer started label ${startedPrints} but only ${expectPrints} was asked for. Closing the link.`); autoDisc=true; try{ dev.gatt.disconnect(); }catch(e){} expectPrints=0;
       showErr('The printer tried to print extra labels, so the app stopped it. Tap "Set up paper" under Printer & advanced once so it learns your label size.'); }
   }
 }
-let lastPrinterError='', expectPrints=0, startedPrints=0, creditCount=0, paperNo=0;
+let lastPrinterError='', expectPrints=0, startedPrints=0, creditCount=0, paperNo=0, doneCount=0, autoDisc=false;
 async function stopPrinter(){
   for(const cmd of ['\x1b!P','\x1b!C','\x1b!R']){ try{ await writeOne(enc(cmd)); log('Sent stop: '+JSON.stringify(cmd)); }catch(e){ log('stop failed: '+e.message); } await sleep(150); }
 }
@@ -731,14 +739,18 @@ async function sendBytes(bytes,onProg,opt){
   const timed=pr=>Promise.race([pr,new Promise((_,rej)=>setTimeout(()=>rej(new Error('The printer stopped answering')),6000))]);
   const cs=pktSize[svc]?Math.max(20,Math.min(pktSize[svc]-3,509)):Math.max(20,C.chunk);
   const gap=Math.max(0,C.delay);
-  let mode=creditSeen[svc]?'credits':'timed', used=0, granted0=credits[svc]||0;
+  let mode=creditSeen[svc]?'credits':'timed', used=0, granted0=credits[svc]||0, maxWait=0;
   for(let i=0;i<bytes.length;i+=cs){
     if(stopFlag) throw new Error('Stopped');
     if(mode==='credits'){
       const tw=performance.now();
-      while(!(credits[svc]>0)&&performance.now()-tw<1500){ if(stopFlag) throw new Error('Stopped'); await new Promise(r=>{ creditWake=r; setTimeout(r,20); }); }
-      if(credits[svc]>0){ credits[svc]--; used++; }
-      else { mode='timed'; log(`Printer stopped giving credits after ${used} packets; switching to timed sending`); }
+      while(!(credits[svc]>0)){
+        if(stopFlag) throw new Error('Stopped');
+        if(performance.now()-tw>15000) throw new Error(`The printer stopped asking for data after ${used} packets`);
+        await new Promise(r=>{ creditWake=r; setTimeout(r,20); });
+      }
+      const waited=performance.now()-tw; if(waited>maxWait) maxWait=waited;
+      credits[svc]--; used++;
     }
     const part=bytes.subarray(i,Math.min(bytes.length,i+cs));
     for(let tries=0;;tries++){ try{ await timed(writeOne(part)); break; }
@@ -746,7 +758,7 @@ async function sendBytes(bytes,onProg,opt){
     if(mode==='timed'&&gap) await sleep(gap);
     onProg&&onProg(Math.min(bytes.length,i+cs));
   }
-  log(`Sent ${(bytes.length/1024).toFixed(1)} KB in ${((performance.now()-t0)/1000).toFixed(1)} s (${cs}-byte packets, ${mode==='credits'?'paced by printer credits':'timed '+gap+' ms'}; ${used} credits used, ${granted0} at start)`);
+  log(`Sent ${(bytes.length/1024).toFixed(1)} KB in ${((performance.now()-t0)/1000).toFixed(1)} s (${cs}-byte packets, ${mode==='credits'?'paced by printer credits':'timed '+gap+' ms'}; ${used} credits used, ${granted0} at start, longest wait ${Math.round(maxWait)} ms)`);
 }
 const enc=s=>new TextEncoder().encode(s);
 function concat(parts){ let n=0; parts.forEach(p=>n+=p.length); const o=new Uint8Array(n); let k=0; parts.forEach(p=>{o.set(p,k);k+=p.length;}); return o; }
@@ -824,10 +836,11 @@ function buildJob(out,copies,C){
   return concat(parts);
 }
 async function printList(items){
+  if(!wchar&&dev&&!manualDisc){ try{ await attach(); }catch(e){ log('Reconnect failed: '+e.message); } }
   if(!wchar){ if(!hasBt){ $('noBt').hidden=false; return; } await $('connectBtn').onclick(); if(!wchar) return; }
   const C=cfg(); stopFlag=false; printing=true; $('printBtn').textContent='Stop';
   try{
-    expectPrints=items.reduce((a,it)=>a+it.copies,0); startedPrints=0;
+    expectPrints=items.reduce((a,it)=>a+it.copies,0); startedPrints=0; doneCount=0;
     const jobs=items.map(it=>buildJob(it.out,it.copies,C)); const total=jobs.reduce((a,j)=>a+j.length,0); let done=0;
     lastPrint={when:new Date().toISOString(),settings:C,jobs,outs:items.map(it=>it.out),result:'sending'};
     for(let k=0;k<jobs.length;k++){ setSum(`Printing label <b>${k+1}</b> of <b>${jobs.length}</b>…`,true);
@@ -909,7 +922,7 @@ function lzo1xCompress(src){
 
 
 /* ---------- problem report ---------- */
-const APP_VERSION='16';
+const APP_VERSION='18';
 let lastPrint=null;
 function describeJob(job){
   // List every command in the job; image data is summarised by its size.
@@ -1052,7 +1065,7 @@ function removeSample(){ labels=labels.filter(l=>!l.src.sample); for(let i=sourc
 
 loadSettings(); $('customRow').hidden=$('size').value!=='custom'; $('densityOut').textContent=$('density').value; $('threshOut').textContent=$('thresh').value;
 sample(); renderAll();
-log('App version 16 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
+log('App version 18 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
 })();
 </script>
 </body></html>
