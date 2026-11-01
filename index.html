@@ -262,8 +262,8 @@ let nextId = 1;
 
 /* ---------- settings ---------- */
 const S_IDS = ['size','copies','cw','ch','density','thresh','mode','fit','autorot','trim','proto','gap','gapmm','margin','speed','chunk','delay','headDots','flip','invert','detect','rate'];
-function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set7')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
-function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set7',JSON.stringify(s)); }catch(e){} }
+function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set9')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
+function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set9',JSON.stringify(s)); }catch(e){} }
 function num(id,d){ const v=parseFloat($(id).value); return isFinite(v)?v:d; }
 function cfg(){
   let w,h; const sz=$('size').value;
@@ -517,7 +517,7 @@ async function findChannel(gatt){
   const cands=[];
   for(const sv of services){ let chars=[]; try{ chars=await sv.getCharacteristics(); }catch(e){ log('chars '+sv.uuid+': '+e.message); }
     for(const ch of chars){ const p=ch.properties; log(`svc ${sv.uuid} chr ${ch.uuid} w:${p.write} wnr:${p.writeWithoutResponse} n:${p.notify}`);
-      if(p.notify||p.indicate){ try{ await ch.startNotifications(); ch.addEventListener('characteristicvaluechanged',ev=>{ const v=new Uint8Array(ev.target.value.buffer); log('printer says: '+[...v].map(b=>b.toString(16).padStart(2,'0')).join(' ')); }); }catch(e){} }
+      if(p.notify||p.indicate){ try{ await ch.startNotifications(); ch.addEventListener('characteristicvaluechanged',onNotify); }catch(e){} }
       if(p.write||p.writeWithoutResponse) cands.push(ch); } }
   const score=ch=>{ const u=ch.uuid.toLowerCase(); const i=PREFER.findIndex(k=>u.includes(k)); return i<0?99:i; };
   cands.sort((a,b)=>score(a)-score(b)); allChars=cands;
@@ -534,12 +534,15 @@ $('connectBtn').onclick=async()=>{
     chip('busy','Choose your D520…');
     dev=await pickDevice();
     log('Picked: '+(dev.name||'(no name)')+' '+(dev.id||''));
-    dev.addEventListener('gattserverdisconnected',()=>{ wchar=null; chip('','Not connected'); log('Disconnected'); });
+    dev.addEventListener('gattserverdisconnected',()=>{ for(const k in credits){ delete credits[k]; delete creditSeen[k]; } wchar=null; chip('','Not connected'); log('Disconnected'); });
     chip('busy','Connecting to '+(dev.name||'printer')+'…');
     let gatt; for(let k=0;k<3;k++){ try{ gatt=await dev.gatt.connect(); break; }catch(e){ log('connect try '+(k+1)+': '+e.message); if(k===2) throw e; await sleep(800); } }
     wchar=await findChannel(gatt);
     if(!wchar) throw new Error('Connected to '+(dev.name||'the printer')+' but found no print channel. Turn the printer off and on, make sure no other app is connected to it, then tap Connect again. Open "Connection log" under Printer & advanced and send a screenshot if it still fails.');
+    await sleep(400);
+    { const cur=wchar.service.uuid.toUpperCase(); if(!creditSeen[cur]){ const alt=allChars.find(c=>creditSeen[c.service.uuid.toUpperCase()]); if(alt){ log('Switching to '+alt.uuid+' (the printer talks on that service)'); wchar=alt; } } }
     noResp=!!wchar.properties.writeWithoutResponse; pipeOK=null;
+    { const sv=wchar.service.uuid.toUpperCase(); log('Printer flow control: '+(creditSeen[sv]?'on ('+(credits[sv]||0)+' packets ready, '+(pktSize[sv]||'?')+'-byte packets)':'not seen yet')); }
     log('Using '+wchar.uuid+(noResp?' (fast)':' (with response)'));
     chip('on',(dev.name||'Printer')+' connected');
   }catch(e){
@@ -550,6 +553,26 @@ $('connectBtn').onclick=async()=>{
   }
 };
 let pipeOK=null; // can this browser queue several Bluetooth writes at once?
+// The D520 tells the app how many packets it is ready for ("01 nn" = nn more packets) and the packet size ("02 lo hi").
+const credits={}, pktSize={}, creditSeen={}; let creditWake=null;
+function onNotify(ev){
+  const v=new Uint8Array(ev.target.value.buffer), svc=ev.target.service.uuid.toUpperCase();
+  if(v.length===2&&v[0]===1){ credits[svc]=(credits[svc]||0)+v[1]; creditSeen[svc]=true; if(creditWake){ const w=creditWake; creditWake=null; w(); } if(!printing) log(`printer ready for ${v[1]} packet(s)`); return; }
+  if(v.length===3&&v[0]===2){ pktSize[svc]=v[1]|(v[2]<<8); log('printer packet size: '+pktSize[svc]+' bytes'); return; }
+  const asText=String.fromCharCode(...v.subarray(0,40)).replace(/[^\x20-\x7e]/g,'.');
+  log('printer says: '+[...v.subarray(0,24)].map(b=>b.toString(16).padStart(2,'0')).join(' ')+(v.length>24?' …':'')+'  "'+asText+'"');
+  if(/Cmd error/.test(asText)) lastPrinterError=asText.trim();
+}
+let lastPrinterError='';
+async function takeCredit(svc){
+  const t0=performance.now();
+  while(!(credits[svc]>0)){
+    if(stopFlag) throw new Error('Stopped');
+    if(performance.now()-t0>8000) throw new Error('The printer stopped asking for data');
+    await new Promise(r=>{ creditWake=r; setTimeout(r,50); });
+  }
+  credits[svc]--;
+}
 function writeOne(part){
   if(noResp&&wchar.writeValueWithoutResponse) return wchar.writeValueWithoutResponse(part);
   if(wchar.writeValueWithResponse) return wchar.writeValueWithResponse(part);
@@ -563,20 +586,33 @@ async function checkPipe(){
 }
 let stopFlag=false;
 async function sendBytes(bytes,onProg,opt){
-  const C=Object.assign(cfg(),opt||{}), cs=Math.max(20,C.chunk), t0=performance.now(), rate=Math.max(1,C.rate)*1024;
-  const timed=pr=>Promise.race([pr,new Promise((_,rej)=>setTimeout(()=>rej(new Error('The printer stopped answering')),5000))]);
-  const pipe=await checkPipe(), WIN=pipe?4:1; const inflight=[];
+  const C=Object.assign(cfg(),opt||{}), t0=performance.now(), svc=wchar.service.uuid.toUpperCase();
+  const timed=pr=>Promise.race([pr,new Promise((_,rej)=>setTimeout(()=>rej(new Error('The printer stopped answering')),6000))]);
+  const inflight=[];
+  if(creditSeen[svc]){
+    // Same way the official app does it: one packet per credit the printer hands out.
+    const cs=Math.max(20,Math.min(pktSize[svc]||C.chunk,500));
+    for(let i=0;i<bytes.length;i+=cs){
+      if(stopFlag) throw new Error('Stopped');
+      await takeCredit(svc);
+      inflight.push(timed(writeOne(bytes.subarray(i,Math.min(bytes.length,i+cs)))));
+      if(inflight.length>=8) await inflight.shift();
+      onProg&&onProg(Math.min(bytes.length,i+cs));
+    }
+    await Promise.all(inflight);
+    log(`Sent ${(bytes.length/1024).toFixed(1)} KB in ${((performance.now()-t0)/1000).toFixed(1)} s (printer-paced, ${cs}-byte packets)`);
+    return;
+  }
+  const cs=Math.max(20,C.chunk), rate=Math.max(1,C.rate)*1024;
   for(let i=0;i<bytes.length;i+=cs){
     if(stopFlag) throw new Error('Stopped');
-    const part=bytes.subarray(i,Math.min(bytes.length,i+cs));
-    // keep to the speed the printer can take in, so nothing gets dropped
     const due=t0+(i/rate)*1000, now=performance.now(); if(due>now) await sleep(due-now);
-    inflight.push(timed(writeOne(part)));
-    if(inflight.length>=WIN) await inflight.shift();
+    inflight.push(timed(writeOne(bytes.subarray(i,Math.min(bytes.length,i+cs)))));
+    if(inflight.length>=4) await inflight.shift();
     onProg&&onProg(Math.min(bytes.length,i+cs));
   }
   await Promise.all(inflight);
-  const sec=(performance.now()-t0)/1000; log(`Sent ${(bytes.length/1024).toFixed(1)} KB in ${sec.toFixed(1)} s`);
+  log(`Sent ${(bytes.length/1024).toFixed(1)} KB in ${((performance.now()-t0)/1000).toFixed(1)} s (timed, ${cs}-byte packets)`);
 }
 const enc=s=>new TextEncoder().encode(s);
 function concat(parts){ let n=0; parts.forEach(p=>n+=p.length); const o=new Uint8Array(n); let k=0; parts.forEach(p=>{o.set(p,k);k+=p.length;}); return o; }
@@ -664,7 +700,7 @@ $('feedBtn').onclick=async()=>{ if(!wchar){ await $('connectBtn').onclick(); if(
   try{ await sendBytes(enc(s)); log('Feed sent'); }catch(e){ log('Feed error '+e.message); } };
 
 /* ---------- problem report ---------- */
-const APP_VERSION='8';
+const APP_VERSION='9';
 let lastPrint=null;
 function describeJob(job){
   // List every command in the job; image data is summarised by its size.
@@ -685,7 +721,7 @@ function makeReport(full){
   L.push('D520 LABEL PRINTER — PROBLEM REPORT','App version: '+APP_VERSION,'Made: '+new Date().toString(),'Browser: '+navigator.userAgent,'Page: '+location.href,'');
   L.push('== Printer ==','Device: '+(dev?(dev.name||'(no name)')+' id '+dev.id:'none picked'),'Connected: '+!!(dev&&dev.gatt&&dev.gatt.connected),
     'Channel used: '+(wchar?wchar.uuid+' write:'+wchar.properties.write+' writeNoResponse:'+wchar.properties.writeWithoutResponse+' notify:'+wchar.properties.notify:'none'),
-    'Other writable channels: '+(allChars.filter(c=>c!==wchar).map(c=>c.uuid).join(', ')||'none'),'Queued writes allowed: '+pipeOK,'');
+    'Other writable channels: '+(allChars.filter(c=>c!==wchar).map(c=>c.uuid).join(', ')||'none'),'Printer flow control: '+(wchar?JSON.stringify({ready:credits[wchar.service.uuid.toUpperCase()],seen:!!creditSeen[wchar.service.uuid.toUpperCase()],packet:pktSize[wchar.service.uuid.toUpperCase()]}):'n/a'),'Last printer error: '+(lastPrinterError||'none'),'');
   L.push('== Settings ==',JSON.stringify(C),'');
   L.push('== Labels in queue ==');
   labels.forEach((l,k)=>L.push(`${k+1}. ${l.src.name} | on:${l.on} copies:${l.copies} rotate:${l.rot} crop:${JSON.stringify(l.rect)} source:${l.src.canvas.width}x${l.src.canvas.height}`));
@@ -778,7 +814,7 @@ function removeSample(){ labels=labels.filter(l=>!l.src.sample); for(let i=sourc
 
 loadSettings(); $('customRow').hidden=$('size').value!=='custom'; $('densityOut').textContent=$('density').value; $('threshOut').textContent=$('thresh').value;
 sample(); renderAll();
-log('App version 8 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
+log('App version 9 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
 })();
 </script>
 </body></html>
