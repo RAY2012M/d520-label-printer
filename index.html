@@ -692,15 +692,16 @@ function onNotify(ev){
   const asText=String.fromCharCode(...v.subarray(0,40)).replace(/[^\x20-\x7e]/g,'.');
   log('printer says: '+[...v.subarray(0,24)].map(b=>b.toString(16).padStart(2,'0')).join(' ')+(v.length>24?' …':'')+'  "'+asText+'"');
   if(/Cmd error/.test(asText)) lastPrinterError=asText.trim();
+  if(/GETPAPER:NO/.test(asText)){ paperNo++; showErr('The printer says it sees no paper. Check the labels sit under the sensor guide, then tap the gear and Set up paper again.'); }
   if(/GETPRINTING:DOING/.test(asText)&&expectPrints>0){
     startedPrints++;
     if(startedPrints>expectPrints){ log(`Printer started label ${startedPrints} but only ${expectPrints} was asked for. Stopping it.`); stopPrinter(); expectPrints=0;
       showErr('The printer tried to print extra labels, so the app stopped it. Tap "Set up paper" under Printer & advanced once so it learns your label size.'); }
   }
 }
-let lastPrinterError='', expectPrints=0, startedPrints=0, creditCount=0;
+let lastPrinterError='', expectPrints=0, startedPrints=0, creditCount=0, paperNo=0;
 async function stopPrinter(){
-  for(const cmd of ['\x1b!C','\x1b!R']){ try{ await writeOne(enc(cmd)); log('Sent stop: '+JSON.stringify(cmd)); }catch(e){ log('stop failed: '+e.message); } await sleep(150); }
+  for(const cmd of ['\x1b!P','\x1b!C','\x1b!R']){ try{ await writeOne(enc(cmd)); log('Sent stop: '+JSON.stringify(cmd)); }catch(e){ log('stop failed: '+e.message); } await sleep(150); }
 }
 async function takeCredit(svc){
   const t0=performance.now();
@@ -733,7 +734,7 @@ async function sendBytes(bytes,onProg,opt){
     if(stopFlag) throw new Error('Stopped');
     if(mode==='credits'){
       const tw=performance.now();
-      while(!(credits[svc]>0)&&performance.now()-tw<400){ if(stopFlag) throw new Error('Stopped'); await new Promise(r=>{ creditWake=r; setTimeout(r,20); }); }
+      while(!(credits[svc]>0)&&performance.now()-tw<1500){ if(stopFlag) throw new Error('Stopped'); await new Promise(r=>{ creditWake=r; setTimeout(r,20); }); }
       if(credits[svc]>0){ credits[svc]--; used++; }
       else { mode='timed'; log(`Printer stopped giving credits after ${used} packets; switching to timed sending`); }
     }
@@ -842,7 +843,7 @@ $('feedBtn').onclick=async()=>{ if(!wchar){ await $('connectBtn').onclick(); if(
   try{ await sendBytes(enc(s)); log('Feed sent'); }catch(e){ log('Feed error '+e.message); } };
 
 /* ---------- problem report ---------- */
-const APP_VERSION='14';
+const APP_VERSION='15';
 let lastPrint=null;
 function describeJob(job){
   // List every command in the job; image data is summarised by its size.
@@ -863,7 +864,7 @@ function makeReport(full){
   L.push('D520 LABEL PRINTER — PROBLEM REPORT','App version: '+APP_VERSION,'Made: '+new Date().toString(),'Browser: '+navigator.userAgent,'Page: '+location.href,'');
   L.push('== Printer ==','Device: '+(dev?(dev.name||'(no name)')+' id '+dev.id:'none picked'),'Connected: '+!!(dev&&dev.gatt&&dev.gatt.connected),
     'Channel used: '+(wchar?wchar.uuid+' write:'+wchar.properties.write+' writeNoResponse:'+wchar.properties.writeWithoutResponse+' notify:'+wchar.properties.notify:'none'),
-    'Other writable channels: '+(allChars.filter(c=>c!==wchar).map(c=>c.uuid).join(', ')||'none'),'Printer flow control: '+(wchar?JSON.stringify({ready:credits[wchar.service.uuid.toUpperCase()],seen:!!creditSeen[wchar.service.uuid.toUpperCase()],packet:pktSize[wchar.service.uuid.toUpperCase()]}):'n/a'),'Last printer error: '+(lastPrinterError||'none'),'Credit messages received: '+creditCount,'Paper set up: '+(()=>{try{return localStorage.getItem('d520cal')==='1';}catch(e){return 'unknown';}})(),'');
+    'Other writable channels: '+(allChars.filter(c=>c!==wchar).map(c=>c.uuid).join(', ')||'none'),'Printer flow control: '+(wchar?JSON.stringify({ready:credits[wchar.service.uuid.toUpperCase()],seen:!!creditSeen[wchar.service.uuid.toUpperCase()],packet:pktSize[wchar.service.uuid.toUpperCase()]}):'n/a'),'Last printer error: '+(lastPrinterError||'none'),'Credit messages received: '+creditCount,'Paper status replies: '+paperNo+' x NO','Paper set up: '+(()=>{try{return localStorage.getItem('d520cal')==='1';}catch(e){return 'unknown';}})(),'');
   L.push('== Settings ==',JSON.stringify(C),'');
   L.push('== Labels in queue ==');
   labels.forEach((l,k)=>L.push(`${k+1}. ${l.src.name} | on:${l.on} copies:${l.copies} rotate:${l.rot} crop:${JSON.stringify(l.rect)} source:${l.src.canvas.width}x${l.src.canvas.height}`));
@@ -983,7 +984,7 @@ function removeSample(){ labels=labels.filter(l=>!l.src.sample); for(let i=sourc
 
 loadSettings(); $('customRow').hidden=$('size').value!=='custom'; $('densityOut').textContent=$('density').value; $('threshOut').textContent=$('thresh').value;
 sample(); renderAll();
-log('App version 14 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
+log('App version 15 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
 })();
 </script>
 </body></html>
