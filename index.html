@@ -199,6 +199,7 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
         <label class="f">Print speed (1–6)<input id="speed" type="number" min="1" max="6" value="4"></label>
         <label class="f">Send chunk (bytes)<input id="chunk" type="number" min="20" max="512" value="100"></label>
         <label class="f">Pause per chunk (ms)<input id="delay" type="number" min="0" max="100" value="0"></label>
+        <label class="f">Send speed (KB per second)<input id="rate" type="number" min="1" max="60" value="6"></label>
         <label class="f">Head width (dots)<input id="headDots" type="number" min="384" max="864" value="832"></label>
       </div>
       <div class="row" style="margin-top:10px">
@@ -215,6 +216,16 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
         <pre id="log"></pre>
       </details>
     </details>
+  </section>
+  <section class="panel" id="reportPanel">
+    <h2>Problem report</h2>
+    <p class="hint" style="margin:0">If a print fails, make a report and send it to Claude in the chat. It holds the connection log, your settings, what the printer replied, and the exact data that was sent, so the problem can be found without guessing.</p>
+    <div class="row">
+      <button id="repShare" class="primary">Share report</button>
+      <button id="repSave">Save report file</button>
+      <button id="repCopy">Copy report text</button>
+    </div>
+    <p class="hint" id="repMsg" style="margin:0"></p>
   </section>
 </div>
 
@@ -250,9 +261,9 @@ let labels = [];      // {id, src, rect:{x,y,w,h}, rot, copies, on, out}
 let nextId = 1;
 
 /* ---------- settings ---------- */
-const S_IDS = ['size','copies','cw','ch','density','thresh','mode','fit','autorot','trim','proto','gap','gapmm','margin','speed','chunk','delay','headDots','flip','invert','detect'];
-function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set6')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
-function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set6',JSON.stringify(s)); }catch(e){} }
+const S_IDS = ['size','copies','cw','ch','density','thresh','mode','fit','autorot','trim','proto','gap','gapmm','margin','speed','chunk','delay','headDots','flip','invert','detect','rate'];
+function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set7')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
+function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set7',JSON.stringify(s)); }catch(e){} }
 function num(id,d){ const v=parseFloat($(id).value); return isFinite(v)?v:d; }
 function cfg(){
   let w,h; const sz=$('size').value;
@@ -261,7 +272,7 @@ function cfg(){
   const pw=Math.min(head,Math.round(w*DPI)), ph=Math.round(h*DPI);
   return {w,h,pw,ph,density:num('density',10),thresh:num('thresh',160),mode:$('mode').value,fit:$('fit').value,
     autorot:$('autorot').checked,trim:$('trim').checked,proto:$('proto').value,gap:$('gap').value,gapmm:num('gapmm',3),
-    margin:num('margin',1.5),speed:num('speed',4),chunk:Math.round(num('chunk',180)),delay:num('delay',12),
+    margin:num('margin',1.5),speed:num('speed',4),chunk:Math.round(num('chunk',180)),delay:num('delay',0),rate:num('rate',6),
     flip:$('flip').checked,invert:$('invert').checked,detect:$('detect').value};
 }
 
@@ -550,20 +561,18 @@ async function checkPipe(){
   catch(e){ pipeOK=false; log('Queued writes not allowed: '+e.message); await sleep(200); }
   log('Fast queued sending: '+(pipeOK?'on':'off')); return pipeOK;
 }
+let stopFlag=false;
 async function sendBytes(bytes,onProg,opt){
-  const C=Object.assign(cfg(),opt||{}), cs=Math.max(20,C.chunk), t0=performance.now();
+  const C=Object.assign(cfg(),opt||{}), cs=Math.max(20,C.chunk), t0=performance.now(), rate=Math.max(1,C.rate)*1024;
   const timed=pr=>Promise.race([pr,new Promise((_,rej)=>setTimeout(()=>rej(new Error('The printer stopped answering')),5000))]);
-  const pipe=await checkPipe(), WIN=pipe?8:1; const inflight=[];
+  const pipe=await checkPipe(), WIN=pipe?4:1; const inflight=[];
   for(let i=0;i<bytes.length;i+=cs){
+    if(stopFlag) throw new Error('Stopped');
     const part=bytes.subarray(i,Math.min(bytes.length,i+cs));
-    if(WIN===1){
-      for(let tries=0;;tries++){ try{ await timed(writeOne(part)); break; }
-        catch(e){ if(tries>3) throw e; log('write retry: '+e.message); await sleep(80*(tries+1)); } }
-      if(C.delay) await sleep(C.delay);
-    } else {
-      inflight.push(timed(writeOne(part)));
-      if(inflight.length>=WIN) await inflight.shift();
-    }
+    // keep to the speed the printer can take in, so nothing gets dropped
+    const due=t0+(i/rate)*1000, now=performance.now(); if(due>now) await sleep(due-now);
+    inflight.push(timed(writeOne(part)));
+    if(inflight.length>=WIN) await inflight.shift();
     onProg&&onProg(Math.min(bytes.length,i+cs));
   }
   await Promise.all(inflight);
@@ -580,18 +589,33 @@ function buildJob(out,copies,C){
     head+= C.gap==='cont'?'GAP 0 mm,0 mm\r\n': C.gap==='mark'?`BLINE ${C.gapmm} mm,0 mm\r\n`:`GAP ${C.gapmm} mm,0 mm\r\n`;
     head+=`DIRECTION ${C.flip?1:0},0\r\nREFERENCE 0,0\r\nDENSITY ${Math.round(C.density)}\r\nSPEED ${Math.round(C.speed)}\r\nCLS\r\n`;
     if(C.invert){ head+=`BITMAP 0,0,${out.bpr},${out.h},0,`; return concat([enc(head),data,enc(`\r\nPRINT 1,${copies}\r\n`)]); }
-    // Send only the parts of the label that have ink: blank rows are skipped, each block is cropped left/right.
-    const parts=[enc(head)], bpr=out.bpr, B=16; let y=0;
-    const bandInk=y0=>{ let l=bpr,r=-1; const y1=Math.min(out.h,y0+B); for(let yy=y0;yy<y1;yy++){ const o=yy*bpr; for(let xb=0;xb<bpr;xb++) if(out.bits[o+xb]){ if(xb<l)l=xb; if(xb>r)r=xb; } } return r<0?null:[l,r]; };
-    while(y<out.h){
-      let ink=bandInk(y); if(!ink){ y+=B; continue; }
+    // 1. Solid shapes (barcode bars, lines, boxes) become BAR commands: a few bytes each instead of image data.
+    const bpr=out.bpr, W=out.w, H=out.h, work=out.bits.slice(), bars=[];
+    const px=(x,y)=>(work[y*bpr+(x>>3)]>>(7-(x&7)))&1;
+    let open=new Map();
+    const close=(r,y1)=>{ const h=y1-r.y0, w=r.x1-r.x0; if(w*h>=400) bars.push({x:r.x0,y:r.y0,w,h}); };
+    for(let y=0;y<H;y++){
+      const next=new Map(); let x=0;
+      while(x<W){ while(x<W&&!px(x,y)) x++; if(x>=W) break; const x0=x; while(x<W&&px(x,y)) x++;
+        const k=x0+','+x, o=open.get(k); if(o){ next.set(k,o); open.delete(k); } else next.set(k,{x0,x1:x,y0:y}); }
+      for(const r of open.values()) close(r,y); open=next;
+    }
+    for(const r of open.values()) close(r,H);
+    for(const r of bars) for(let y=r.y;y<r.y+r.h;y++) for(let x=r.x;x<r.x+r.w;x++) work[y*bpr+(x>>3)]&=~(0x80>>(x&7));
+    // 2. What is left (text, logos) goes as image blocks; blank rows are skipped and each block is cropped.
+    const parts=[enc(head)], B=16; let y=0;
+    const bandInk=y0=>{ let l=bpr,r=-1; const y1=Math.min(H,y0+B); for(let yy=y0;yy<y1;yy++){ const o=yy*bpr; for(let xb=0;xb<bpr;xb++) if(work[o+xb]){ if(xb<l)l=xb; if(xb>r)r=xb; } } return r<0?null:[l,r]; };
+    while(y<H){
+      const ink=bandInk(y); if(!ink){ y+=B; continue; }
       let y0=y,l=ink[0],r=ink[1]; y+=B;
-      while(y<out.h){ const k=bandInk(y); if(!k) break; l=Math.min(l,k[0]); r=Math.max(r,k[1]); y+=B; if(y-y0>=512) break; }
-      const y1=Math.min(out.h,y), wb=r-l+1, hh=y1-y0, blk=new Uint8Array(wb*hh);
-      for(let yy=0;yy<hh;yy++) blk.set(data.subarray((y0+yy)*bpr+l,(y0+yy)*bpr+r+1),yy*wb);
+      while(y<H&&y-y0<128){ const k=bandInk(y); if(!k) break; l=Math.min(l,k[0]); r=Math.max(r,k[1]); y+=B; }
+      const y1=Math.min(H,y), wb=r-l+1, hh=y1-y0, blk=new Uint8Array(wb*hh);
+      for(let yy=0;yy<hh;yy++){ const o=(y0+yy)*bpr+l; for(let c=0;c<wb;c++) blk[yy*wb+c]=(~work[o+c])&0xff; }
       parts.push(enc(`BITMAP ${l*8},${y0},${wb},${hh},0,`),blk,enc('\r\n'));
     }
-    parts.push(enc(`PRINT 1,${copies}\r\n`));
+    // 3. Bars are drawn after the images so the images can't paint over them.
+    let txt=''; for(const r of bars) txt+=`BAR ${r.x},${r.y},${r.w},${r.h}\r\n`;
+    parts.push(enc(txt+`PRINT 1,${copies}\r\n`));
     return concat(parts);
   }
   if(C.proto==='phomemo'){
@@ -615,16 +639,20 @@ function buildJob(out,copies,C){
 }
 async function printList(items){
   if(!wchar){ if(!hasBt){ $('noBt').hidden=false; $('noBt').scrollIntoView({behavior:'smooth'}); return; } await $('connectBtn').onclick(); if(!wchar) return; }
-  const C=cfg(); $('printBtn').disabled=true;
+  const C=cfg(); stopFlag=false; printing=true; $('printBtn').textContent='Stop';
   try{
     const jobs=items.map(it=>buildJob(it.out,it.copies,C)); const total=jobs.reduce((a,j)=>a+j.length,0); let done=0;
+    lastPrint={when:new Date().toISOString(),settings:C,jobs,outs:items.map(it=>it.out),result:'sending'};
     for(let k=0;k<jobs.length;k++){ setSum(`Printing label <b>${k+1}</b> of <b>${jobs.length}</b>…`,true);
       await sendBytes(jobs[k],n=>{ $('progBar').style.width=((done+n)/total*100).toFixed(1)+'%'; }); done+=jobs[k].length; await sleep(250); }
-    log('Sent '+jobs.length+' label job(s), '+total+' bytes'); setSum(`Sent <b>${jobs.length}</b> label${jobs.length===1?'':'s'} to the printer`,true);
-  }catch(e){ log('Print error: '+e.message); setSum('Print stopped: '+e.message+'. Reconnect and try again.'); }
-  finally{ $('printBtn').disabled=false; setTimeout(()=>$('progBar').style.width='0',1500); }
+    lastPrint.result='all data sent'; log('Sent '+jobs.length+' label job(s), '+total+' bytes'); setSum(`Sent <b>${jobs.length}</b> label${jobs.length===1?'':'s'} to the printer`,true);
+  }catch(e){ log('Print error: '+e.message); if(lastPrint) lastPrint.result='failed: '+e.message;
+    if(e.message==='Stopped'){ try{ await writeOne(enc('\x1b!R')); log('Printer reset sent'); }catch(_){} setSum('Stopped. The printer was told to cancel.'); }
+    else setSum('Print stopped: '+e.message+'. Reconnect and try again.'); }
+  finally{ printing=false; $('printBtn').textContent='Print'; setTimeout(()=>$('progBar').style.width='0',1500); }
 }
-$('printBtn').onclick=()=>{ const act=labels.filter(l=>l.on&&l.out); if(!act.length){ setSum('Add a label first.'); return; } printList(act.map(l=>({out:l.out,copies:l.copies}))); };
+let printing=false;
+$('printBtn').onclick=()=>{ if(printing){ stopFlag=true; return; } const act=labels.filter(l=>l.on&&l.out); if(!act.length){ setSum('Add a label first.'); return; } printList(act.map(l=>({out:l.out,copies:l.copies}))); };
 $('testBtn').onclick=()=>{ const C=cfg(); const c=document.createElement('canvas'); c.width=800; c.height=Math.round(800*C.h/C.w);
   const x=c.getContext('2d'); x.fillStyle='#fff'; x.fillRect(0,0,c.width,c.height);   x.fillStyle='#000'; x.font='bold 70px sans-serif'; x.fillText('D520 TEST',50,120); x.font='34px sans-serif';
   x.fillText(`${C.w} x ${C.h} in · density ${C.density}`,50,180); x.fillText(new Date().toLocaleString(),50,230);
@@ -634,6 +662,66 @@ $('testBtn').onclick=()=>{ const C=cfg(); const c=document.createElement('canvas
 $('feedBtn').onclick=async()=>{ if(!wchar){ await $('connectBtn').onclick(); if(!wchar) return; } const C=cfg();
   const mm=v=>(v*25.4).toFixed(1); const s=C.proto==='tspl'?`SIZE ${mm(C.w)} mm,${mm(C.h)} mm\r\nGAP ${C.gap==='cont'?0:C.gapmm} mm,0 mm\r\nFORMFEED\r\n`:'\x1b\x64\x08';
   try{ await sendBytes(enc(s)); log('Feed sent'); }catch(e){ log('Feed error '+e.message); } };
+
+/* ---------- problem report ---------- */
+const APP_VERSION='8';
+let lastPrint=null;
+function describeJob(job){
+  // List every command in the job; image data is summarised by its size.
+  const lines=[]; let i=0, n=job.length; const dec=new TextDecoder('latin1');
+  while(i<n && lines.length<400){
+    let j=i; while(j<n&&job[j]!==10) j++;
+    const line=dec.decode(job.subarray(i,Math.min(j,i+120)));
+    const m=/^BITMAP (\d+),(\d+),(\d+),(\d+),(\d+),/.exec(line);
+    if(m){ const len=(+m[3])*(+m[4]); lines.push(`BITMAP ${m[1]},${m[2]},${m[3]},${m[4]},${m[5]}, <${len} bytes of image>`); i=i+m[0].length+len; if(job[i]===13) i++; if(job[i]===10) i++; continue; }
+    if(/^[\x20-\x7e\r]*$/.test(line)) lines.push(line.replace(/\r$/,'')); else { lines.push(`<binary ${Math.min(j,n)-i} bytes: ${[...job.subarray(i,Math.min(j,i+24))].map(b=>b.toString(16).padStart(2,'0')).join(' ')}…>`); }
+    i=j+1;
+  }
+  return lines;
+}
+function b64(u8){ let s=''; for(let i=0;i<u8.length;i+=0x8000) s+=String.fromCharCode.apply(null,u8.subarray(i,i+0x8000)); return btoa(s); }
+function makeReport(full){
+  const C=cfg(), L=[];
+  L.push('D520 LABEL PRINTER — PROBLEM REPORT','App version: '+APP_VERSION,'Made: '+new Date().toString(),'Browser: '+navigator.userAgent,'Page: '+location.href,'');
+  L.push('== Printer ==','Device: '+(dev?(dev.name||'(no name)')+' id '+dev.id:'none picked'),'Connected: '+!!(dev&&dev.gatt&&dev.gatt.connected),
+    'Channel used: '+(wchar?wchar.uuid+' write:'+wchar.properties.write+' writeNoResponse:'+wchar.properties.writeWithoutResponse+' notify:'+wchar.properties.notify:'none'),
+    'Other writable channels: '+(allChars.filter(c=>c!==wchar).map(c=>c.uuid).join(', ')||'none'),'Queued writes allowed: '+pipeOK,'');
+  L.push('== Settings ==',JSON.stringify(C),'');
+  L.push('== Labels in queue ==');
+  labels.forEach((l,k)=>L.push(`${k+1}. ${l.src.name} | on:${l.on} copies:${l.copies} rotate:${l.rot} crop:${JSON.stringify(l.rect)} source:${l.src.canvas.width}x${l.src.canvas.height}`));
+  L.push('');
+  if(lastPrint){
+    L.push('== Last print ==','When: '+lastPrint.when,'Result: '+lastPrint.result);
+    lastPrint.jobs.forEach((job,k)=>{ L.push(`-- Job ${k+1}: ${job.length} bytes --`); describeJob(job).forEach(x=>L.push('  '+x)); });
+    L.push('');
+  } else L.push('== Last print ==','No print sent yet in this session.','');
+  L.push('== Connection log ==',$('log').textContent,'');
+  if(full&&lastPrint){
+    L.push('== Raw data of job 1 (base64) ==',b64(lastPrint.jobs[0]),'');
+    try{ const o=lastPrint.outs[0].canvas, t=document.createElement('canvas'); t.width=Math.round(o.width/2); t.height=Math.round(o.height/2);
+      t.getContext('2d').drawImage(o,0,0,t.width,t.height); L.push('== Label 1 as printed (PNG, half size) ==',t.toDataURL('image/png'),''); }catch(e){}
+  }
+  return L.join('\n');
+}
+function repName(){ const d=new Date(); return `d520-report-${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}-${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}.txt`; }
+$('repShare').onclick=async()=>{
+  const txt=makeReport(true), file=new File([txt],repName(),{type:'text/plain'});
+  try{
+    if(navigator.canShare&&navigator.canShare({files:[file]})){ await navigator.share({files:[file],title:'D520 problem report'}); $('repMsg').textContent='Shared. Send it to Claude in the chat.'; return; }
+    if(navigator.share){ await navigator.share({title:'D520 problem report',text:makeReport(false)}); $('repMsg').textContent='Shared as text.'; return; }
+    $('repSave').onclick();
+  }catch(e){ if(e.name!=='AbortError'){ log('Share failed: '+e.message); $('repSave').onclick(); } }
+};
+$('repSave').onclick=()=>{
+  try{ const url=URL.createObjectURL(new Blob([makeReport(true)],{type:'text/plain'})); const a=document.createElement('a'); a.href=url; a.download=repName(); document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),30000);
+    $('repMsg').textContent='Report file saved ('+repName()+'). If nothing downloaded, use Copy report text and paste it into the chat.'; }
+  catch(e){ $('repMsg').textContent='Saving failed here. Use Copy report text instead.'; }
+};
+$('repCopy').onclick=async()=>{
+  const txt=makeReport(false);
+  try{ await navigator.clipboard.writeText(txt); $('repMsg').textContent='Copied. Paste it into the chat with Claude.'; }
+  catch(e){ const ta=document.createElement('textarea'); ta.value=txt; ta.style.cssText='width:100%;height:160px;font:11px monospace'; $('repMsg').textContent='Copy blocked. Select all the text below and copy it:'; $('repMsg').after(ta); ta.focus(); ta.select(); }
+};
 
 /* ---------- find the working setting ---------- */
 let findPlan=[];
@@ -690,7 +778,7 @@ function removeSample(){ labels=labels.filter(l=>!l.src.sample); for(let i=sourc
 
 loadSettings(); $('customRow').hidden=$('size').value!=='custom'; $('densityOut').textContent=$('density').value; $('threshOut').textContent=$('thresh').value;
 sample(); renderAll();
-log(hasBt?'Bluetooth ready':'Bluetooth not available in this browser');
+log('App version 8 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
 })();
 </script>
 </body></html>
