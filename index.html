@@ -807,6 +807,7 @@ $('connectBtn').onclick=async()=>{
   if(dev&&dev.gatt&&dev.gatt.connected){ manualDisc=true; dev.gatt.disconnect(); return; }
   if(!hasBt){ chip('','Open in Bluefy to print'); return; }
   showErr('');
+  holdUntil=0;
   if(dev&&!dev.gatt.connected){ try{ await attach(); return; }catch(e){ log('Quiet reconnect failed: '+e.message); } }
   try{
     if(navigator.bluetooth.getAvailability){ try{ const ok=await navigator.bluetooth.getAvailability(); log('Bluetooth available: '+ok); if(ok===false) throw Object.assign(new Error('Bluetooth is off, or this browser is not allowed to use it. iPhone Settings > Bluefy > turn on Bluetooth, and make sure Bluetooth is on in Control Center.'),{name:'Unavailable'}); }catch(e){ if(e.name==='Unavailable') throw e; } }
@@ -838,7 +839,7 @@ async function autoConnect(){
   } else log('This browser has no remembered-device list');
   if(d){
     dev=d; wireDevice(dev); manualDisc=false;
-    for(let k=0;k<4;k++){
+    for(let k=0;k<2;k++){
       try{
         chip('busy','Connecting to '+(dev.name||'D520')+'…');
         if(dev.watchAdvertisements&&k>0){ try{ await Promise.race([dev.watchAdvertisements(),sleep(3000)]); }catch(e){} }
@@ -855,7 +856,15 @@ async function autoConnect(){
     await attach(); log('Connected from the startup chooser');
   }catch(e){ log('Startup chooser: '+e.name+' '+e.message); chip('','Tap Connect'); }
 }
+let connecting=null, holdUntil=0, calibrating=0;
 async function attach(){
+  if(dev&&dev.gatt&&dev.gatt.connected&&wchar) return;
+  if(Date.now()<holdUntil) throw new Error('Resting after a print; tap Print or Connect to reconnect');
+  if(connecting) return connecting;
+  connecting=attachInner();
+  try{ return await connecting; } finally{ connecting=null; }
+}
+async function attachInner(){
     chip('busy','Connecting to '+(dev.name||'printer')+'…');
     let gatt; for(let k=0;k<3;k++){ try{ gatt=await dev.gatt.connect(); break; }catch(e){ log('connect try '+(k+1)+': '+e.message); if(k===2) throw e; await sleep(800); } }
     wchar=await findChannel(gatt);
@@ -865,6 +874,7 @@ async function attach(){
     noResp=!!wchar.properties.writeWithoutResponse; pipeOK=null;
     { const sv=wchar.service.uuid.toUpperCase(); log('Printer link: '+(creditSeen[sv]?'on ('+(credits[sv]||0)+' packets ready, '+(pktSize[sv]||'?')+'-byte packets)':'not seen yet')); }
     log('Using '+wchar.uuid+(noResp?' (fast)':' (with response)'));
+    if(Date.now()<holdUntil&&!printing){ log('Late connection during rest; closing it'); autoDisc=true; try{ dev.gatt.disconnect(); }catch(e){} return; }
     chip('on',(dev.name||'Printer')+' connected');
 }
 let pipeOK=null; // can this browser queue several Bluetooth writes at once?
@@ -878,9 +888,12 @@ function onNotify(ev){
   log('printer says: '+[...v.subarray(0,24)].map(b=>b.toString(16).padStart(2,'0')).join(' ')+(v.length>24?' …':'')+'  "'+asText+'"');
   if(/Cmd error/.test(asText)) lastPrinterError=asText.trim();
   if(/GETPAPER:NO/.test(asText)){ paperNo++; showErr('The printer says it sees no paper. Check the labels sit under the sensor guide, then tap the gear and Set up paper again.'); }
+  if(/GETPRINTING:DOING/.test(asText)&&expectPrints===0&&!printing&&Date.now()>calibrating){
+    log('Printer started a label nobody asked for; closing the link'); autoDisc=true; holdUntil=Date.now()+20000; try{ dev.gatt.disconnect(); }catch(e){}
+  }
   if(/GETPRINTING:DONE/.test(asText)&&expectPrints>0){
     doneCount++;
-    if(doneCount>=expectPrints){ log(`Printer finished ${doneCount} label(s); closing the link so nothing repeats`); expectPrints=0; autoDisc=true; setTimeout(()=>{ try{ dev&&dev.gatt.connected&&dev.gatt.disconnect(); }catch(e){} },150); }
+    if(doneCount>=expectPrints){ log(`Printer finished ${doneCount} label(s); closing the link so nothing repeats`); expectPrints=0; autoDisc=true; holdUntil=Date.now()+20000; setTimeout(()=>{ try{ dev&&dev.gatt.connected&&dev.gatt.disconnect(); }catch(e){} },150); }
   }
   if(/GETPRINTING:DOING/.test(asText)&&expectPrints>0){
     startedPrints++;
@@ -1012,6 +1025,7 @@ function buildJob(out,copies,C){
   return concat(parts);
 }
 async function printList(items){
+  holdUntil=0;
   if(!wchar&&dev&&!manualDisc){ try{ await attach(); }catch(e){ log('Reconnect failed: '+e.message); } }
   if(!wchar){ if(!hasBt){ chip('','Open in Bluefy to print'); return; } await $('connectBtn').onclick(); if(!wchar) return; }
   const C=cfg(); stopFlag=false; printing=true; $('printBtn').textContent='Stop'; $('viewer').classList.add('printing'); { const f=$('camflash'); f.classList.remove('go'); void f.offsetWidth; f.classList.add('go'); }
@@ -1035,7 +1049,7 @@ $('testBtn').onclick=()=>{ const C=cfg(); const c=document.createElement('canvas
   for(let i=0;i<40;i++){ x.fillRect(60+i*17,280,(i%3)+3,Math.min(200,c.height*0.2)); }
   x.beginPath(); x.moveTo(40,c.height-40); x.lineTo(c.width-40,c.height-40); x.stroke(); x.font='bold 50px sans-serif'; x.fillText('▲ TOP',50,c.height/2+40);
   const L={src:{canvas:c,name:'test'},rect:{x:0,y:0,w:c.width,h:c.height},rot:0}; const out=renderLabel(L,{...C,trim:false,autorot:false,fit:'fit'}); printList([{out,copies:1}]); };
-$('calBtn').onclick=async()=>{ if(!wchar){ await $('connectBtn').onclick(); if(!wchar) return; } const C=cfg();
+$('calBtn').onclick=async()=>{ calibrating=Date.now()+20000; holdUntil=0; if(!wchar){ await $('connectBtn').onclick(); if(!wchar) return; } const C=cfg();
   const mm=v=>(v*25.4).toFixed(1);
   try{ await sendBytes(enc(`\r\nSIZE ${mm(C.w)} mm,${mm(C.h)} mm\r\nGAPDETECT\r\n`)); try{ localStorage.setItem('d520cal','1'); }catch(e){} log('Paper setup sent (GAPDETECT); later jobs use the measured gap'); setSum('The printer is measuring your labels. It may feed 1 to 3 blank labels.'); }
   catch(e){ log('Paper setup error '+e.message); } };
@@ -1098,7 +1112,7 @@ function lzo1xCompress(src){
 
 
 /* ---------- problem report ---------- */
-const APP_VERSION='22';
+const APP_VERSION='23';
 let lastPrint=null;
 function describeJob(job){
   // List every command in the job; image data is summarised by its size.
@@ -1241,7 +1255,7 @@ function removeSample(){ labels=labels.filter(l=>!l.src.sample); for(let i=sourc
 
 loadSettings(); $('customRow').hidden=$('size').value!=='custom'; $('densityOut').textContent=$('density').value; $('threshOut').textContent=$('thresh').value;
 sample(); renderAll();
-log('App version 22 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
+log('App version 23 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
 setTimeout(autoConnect,2400);
 })();
 </script>
