@@ -321,6 +321,8 @@ svg{fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-l
           <div class="grid2" style="margin-top:12px">
             <label class="f">Printer language
               <select id="proto"><option value="tspl">TSPL (D520)</option><option value="escpos">ESC/POS raster</option><option value="phomemo">Phomemo ESC/POS</option></select></label>
+            <label class="f">Image data
+              <select id="enc"><option value="lzo">Compressed (like the Phomemo app)</option><option value="plain">Plain</option></select></label>
             <label class="f">Paper type
               <select id="gap"><option value="gap">Labels with gaps</option><option value="cont">Continuous roll</option><option value="mark">Black mark</option></select></label>
             <label class="f">Gap between labels (mm)<input id="gapmm" type="number" step="0.5" min="0" max="10" value="3"></label>
@@ -379,9 +381,9 @@ let labels = [];      // {id, src, rect:{x,y,w,h}, rot, copies, on, out}
 let nextId = 1;
 
 /* ---------- settings ---------- */
-const S_IDS = ['size','copies','cw','ch','density','thresh','mode','fit','autorot','trim','proto','gap','gapmm','margin','speed','chunk','delay','headDots','flip','invert','detect','rate'];
-function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set10')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
-function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set10',JSON.stringify(s)); }catch(e){} }
+const S_IDS = ['size','copies','cw','ch','density','thresh','mode','fit','autorot','trim','proto','gap','gapmm','margin','speed','chunk','delay','headDots','flip','invert','detect','rate','enc'];
+function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set16')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
+function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set16',JSON.stringify(s)); }catch(e){} }
 function num(id,d){ const v=parseFloat($(id).value); return isFinite(v)?v:d; }
 function cfg(){
   let w,h; const sz=$('size').value;
@@ -390,7 +392,7 @@ function cfg(){
   const pw=Math.min(head,Math.round(w*DPI)), ph=Math.round(h*DPI);
   return {w,h,pw,ph,density:num('density',10),thresh:num('thresh',160),mode:$('mode').value,fit:$('fit').value,
     autorot:$('autorot').checked,trim:$('trim').checked,proto:$('proto').value,gap:$('gap').value,gapmm:num('gapmm',3),
-    margin:num('margin',1.5),speed:num('speed',4),chunk:Math.round(num('chunk',180)),delay:num('delay',8),rate:num('rate',6),
+    margin:num('margin',1.5),speed:num('speed',4),chunk:Math.round(num('chunk',180)),delay:num('delay',8),rate:num('rate',6),enc:$('enc').value,
     flip:$('flip').checked,invert:$('invert').checked,detect:$('detect').value};
 }
 
@@ -749,6 +751,16 @@ async function sendBytes(bytes,onProg,opt){
 const enc=s=>new TextEncoder().encode(s);
 function concat(parts){ let n=0; parts.forEach(p=>n+=p.length); const o=new Uint8Array(n); let k=0; parts.forEach(p=>{o.set(p,k);k+=p.length;}); return o; }
 function buildJob(out,copies,C){
+  if(C.proto==='tspl'&&C.enc!=='plain'){
+    const mm=v=>(v*25.4).toFixed(1);
+    let cal=false; try{ cal=localStorage.getItem('d520cal')==='1'; }catch(e){}
+    const raw=C.invert?out.bits.map(b=>(~b)&0xff):out.bits;
+    const z=lzo1xCompress(raw);
+    let head=`\r\nDENSITY ${Math.round(C.density)}\r\nSPEED ${Math.round(C.speed)}\r\nREFERENCE 0,0\r\nOFFSET 0 mm\r\nSIZE ${mm(C.w)} mm,${mm(C.h)} mm\r\n`;
+    head+= C.gap==='cont'?'GAP 0 mm,0 mm\r\n': C.gap==='mark'?`BLINE ${C.gapmm} mm,0 mm\r\n`: cal?'':`GAP ${C.gapmm} mm,0 mm\r\n`;
+    head+=`DIRECTION ${C.flip?1:0},0\r\nCLS\r\nBITMAP 0,0,${out.bpr},${out.h},3,${z.length},`;
+    return concat([enc(head),z,enc(`\r\nPRINT 1,${copies}\r\n`)]);
+  }
   if(C.proto==='tspl'){
     const data=new Uint8Array(out.bits.length); // TSPL: 0 bit = black dot
     for(let i=0;i<data.length;i++) data[i]=C.invert?out.bits[i]:(~out.bits[i])&0xff;
@@ -842,8 +854,62 @@ $('feedBtn').onclick=async()=>{ if(!wchar){ await $('connectBtn').onclick(); if(
   const mm=v=>(v*25.4).toFixed(1); const s=C.proto==='tspl'?`SIZE ${mm(C.w)} mm,${mm(C.h)} mm\r\nGAP ${C.gap==='cont'?0:C.gapmm} mm,0 mm\r\nFORMFEED\r\n`:'\x1b\x64\x08';
   try{ await sendBytes(enc(s)); log('Feed sent'); }catch(e){ log('Feed error '+e.message); } };
 
+/* ---------- LZO1X-1 (verified against liblzo2) ---------- */
+// LZO1X-1 compressor (port of miniLZO lzo1x_1_compress), output decodes with any lzo1x_decompress.
+function lzo1xCompress(src){
+  const out=new Uint8Array(src.length+Math.ceil(src.length/16)+64+3); let op=0;
+  const dict=new Uint16Array(1<<14);
+  const rd32=p=>(src[p]|(src[p+1]<<8)|(src[p+2]<<16)|(src[p+3]<<24))>>>0;
+  const lit=(from,t,first)=>{ // emit t literals starting at src[from]
+    if(first&&t<=238){ out[op++]=17+t; }
+    else if(t<=3){ out[op-2]|=t; }
+    else if(t<=18){ out[op++]=t-3; }
+    else { let tt=t-18; out[op++]=0; while(tt>255){ tt-=255; out[op++]=0; } out[op++]=tt; }
+    for(let k=0;k<t;k++) out[op++]=src[from+k];
+  };
+  function doCompress(inS,inLen,ti){
+    const inEnd=inS+inLen, ipEnd=inS+inLen-20; let ip=inS, ii=inS;
+    ip+= ti<4?4-ti:0;
+    dict.fill(0);
+    for(;;){
+      ip+=1+((ip-ii)>>5);
+      for(;;){
+        if(ip>=ipEnd) return inEnd-(ii-ti);
+        const dv=rd32(ip);
+        const di=(Math.imul(0x1824429d,dv)>>>18)&0x3fff;
+        const mPos=inS+dict[di];
+        dict[di]=ip-inS;
+        if(dv!==rd32(mPos)) break;            // -> literal: advance and retry
+        ii-=ti; ti=0;
+        const t=ip-ii;
+        if(t!==0) lit(ii,t,false);
+        let mLen=4;
+        while(ip+mLen<ipEnd && src[ip+mLen]===src[mPos+mLen]) mLen++;
+        let mOff=ip-mPos;
+        ip+=mLen; ii=ip;
+        if(mLen<=8&&mOff<=0x0800){ mOff-=1; out[op++]=((mLen-1)<<5)|((mOff&7)<<2); out[op++]=mOff>>3; }
+        else if(mOff<=0x4000){ mOff-=1;
+          if(mLen<=33) out[op++]=32|(mLen-2);
+          else { mLen-=33; out[op++]=32; while(mLen>255){ mLen-=255; out[op++]=0; } out[op++]=mLen; }
+          out[op++]=(mOff<<2)&0xff; out[op++]=(mOff>>6)&0xff; }
+        else { mOff-=0x4000;
+          if(mLen<=9) out[op++]=16|((mOff>>11)&8)|(mLen-2);
+          else { mLen-=9; out[op++]=16|((mOff>>11)&8); while(mLen>255){ mLen-=255; out[op++]=0; } out[op++]=mLen; }
+          out[op++]=(mOff<<2)&0xff; out[op++]=(mOff>>6)&0xff; }
+      }
+    }
+  }
+  let ip=0, l=src.length, t=0;
+  while(l>20){ const ll=Math.min(l,49152); t=doCompress(ip,ll,t); ip+=ll; l-=ll; }
+  t+=l;
+  if(t>0) lit(src.length-t,t,op===0);
+  out[op++]=17; out[op++]=0; out[op++]=0;
+  return out.slice(0,op);
+}
+
+
 /* ---------- problem report ---------- */
-const APP_VERSION='15';
+const APP_VERSION='16';
 let lastPrint=null;
 function describeJob(job){
   // List every command in the job; image data is summarised by its size.
@@ -851,6 +917,8 @@ function describeJob(job){
   while(i<n && lines.length<400){
     let j=i; while(j<n&&job[j]!==10) j++;
     const line=dec.decode(job.subarray(i,Math.min(j,i+120)));
+    const m3=/^BITMAP (\d+),(\d+),(\d+),(\d+),3,(\d+),/.exec(line);
+    if(m3){ const len=+m3[5]; lines.push(`BITMAP ${m3[1]},${m3[2]},${m3[3]},${m3[4]},3,${len}, <${len} bytes compressed, ${(+m3[3])*(+m3[4])} raw>`); i=i+m3[0].length+len; if(job[i]===13) i++; if(job[i]===10) i++; continue; }
     const m=/^BITMAP (\d+),(\d+),(\d+),(\d+),(\d+),/.exec(line);
     if(m){ const len=(+m[3])*(+m[4]); lines.push(`BITMAP ${m[1]},${m[2]},${m[3]},${m[4]},${m[5]}, <${len} bytes of image>`); i=i+m[0].length+len; if(job[i]===13) i++; if(job[i]===10) i++; continue; }
     if(/^[\x20-\x7e\r]*$/.test(line)) lines.push(line.replace(/\r$/,'')); else { lines.push(`<binary ${Math.min(j,n)-i} bytes: ${[...job.subarray(i,Math.min(j,i+24))].map(b=>b.toString(16).padStart(2,'0')).join(' ')}…>`); }
@@ -984,7 +1052,7 @@ function removeSample(){ labels=labels.filter(l=>!l.src.sample); for(let i=sourc
 
 loadSettings(); $('customRow').hidden=$('size').value!=='custom'; $('densityOut').textContent=$('density').value; $('threshOut').textContent=$('thresh').value;
 sample(); renderAll();
-log('App version 15 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
+log('App version 16 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
 })();
 </script>
 </body></html>
