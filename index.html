@@ -661,12 +661,13 @@ $('connectBtn').onclick=async()=>{
   if(dev&&dev.gatt&&dev.gatt.connected){ manualDisc=true; dev.gatt.disconnect(); return; }
   if(!hasBt){ $('noBt').hidden=false; return; }
   showErr('');
+  if(dev&&!dev.gatt.connected){ try{ await attach(); return; }catch(e){ log('Quiet reconnect failed: '+e.message); } }
   try{
     if(navigator.bluetooth.getAvailability){ try{ const ok=await navigator.bluetooth.getAvailability(); log('Bluetooth available: '+ok); if(ok===false) throw Object.assign(new Error('Bluetooth is off, or this browser is not allowed to use it. iPhone Settings > Bluefy > turn on Bluetooth, and make sure Bluetooth is on in Control Center.'),{name:'Unavailable'}); }catch(e){ if(e.name==='Unavailable') throw e; } }
     chip('busy','Choose your D520…');
     dev=await pickDevice();
     log('Picked: '+(dev.name||'(no name)')+' '+(dev.id||''));
-    dev.addEventListener('gattserverdisconnected',()=>{ for(const k in credits){ delete credits[k]; delete creditSeen[k]; } wchar=null; if(autoDisc){ autoDisc=false; chip('on',(dev.name||'D520')+' ready'); log('Link closed after the print (stops repeats)'); } else { chip('','Not connected'); log('Disconnected'); } });
+    wireDevice(dev); try{ localStorage.setItem('d520dev',dev.id||''); }catch(e){}
     await attach();
   }catch(e){
     log('Connect failed: '+e.name+' '+e.message);
@@ -676,6 +677,24 @@ $('connectBtn').onclick=async()=>{
   }
 };
 let manualDisc=false;
+function wireDevice(d){
+  if(d._wired) return; d._wired=true;
+  d.addEventListener('gattserverdisconnected',()=>{ for(const k in credits){ delete credits[k]; delete creditSeen[k]; } wchar=null; if(autoDisc){ autoDisc=false; chip('on',(d.name||'D520')+' ready'); log('Link closed after the print (stops repeats)'); } else { chip('','Not connected'); log('Disconnected'); } });
+}
+// Reconnect to the printer picked last time, without the picker (needs "Allow future connections" in Bluefy's picker)
+async function autoConnect(){
+  if(!hasBt||!navigator.bluetooth.getDevices) { log('Auto-connect not supported in this browser'); return; }
+  let saved=''; try{ saved=localStorage.getItem('d520dev')||''; }catch(e){}
+  let list=[]; try{ list=await navigator.bluetooth.getDevices(); }catch(e){ log('getDevices: '+e.message); return; }
+  const d=list.find(x=>saved&&x.id===saved)||list.find(x=>/^D5/i.test(x.name||''));
+  if(!d){ log('No remembered printer yet. Tap Connect once and keep "Allow future connections" on.'); return; }
+  dev=d; wireDevice(dev); manualDisc=false;
+  for(let k=0;k<4;k++){
+    try{ chip('busy','Connecting to '+(dev.name||'D520')+'…'); await attach(); log('Auto-connected to '+(dev.name||'printer')); return; }
+    catch(e){ log('Auto-connect try '+(k+1)+': '+e.message); await sleep(1500); }
+  }
+  chip('','Printer off? Tap Connect');
+}
 async function attach(){
     chip('busy','Connecting to '+(dev.name||'printer')+'…');
     let gatt; for(let k=0;k<3;k++){ try{ gatt=await dev.gatt.connect(); break; }catch(e){ log('connect try '+(k+1)+': '+e.message); if(k===2) throw e; await sleep(800); } }
@@ -922,7 +941,7 @@ function lzo1xCompress(src){
 
 
 /* ---------- problem report ---------- */
-const APP_VERSION='18';
+const APP_VERSION='19';
 let lastPrint=null;
 function describeJob(job){
   // List every command in the job; image data is summarised by its size.
@@ -1065,7 +1084,8 @@ function removeSample(){ labels=labels.filter(l=>!l.src.sample); for(let i=sourc
 
 loadSettings(); $('customRow').hidden=$('size').value!=='custom'; $('densityOut').textContent=$('density').value; $('threshOut').textContent=$('thresh').value;
 sample(); renderAll();
-log('App version 18 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
+log('App version 19 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
+setTimeout(autoConnect,300);
 })();
 </script>
 </body></html>
