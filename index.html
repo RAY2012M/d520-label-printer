@@ -197,8 +197,8 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
         <label class="f">Gap between labels (mm)<input id="gapmm" type="number" step="0.5" min="0" max="10" value="3"></label>
         <label class="f">Margin inside label (mm)<input id="margin" type="number" step="0.5" min="0" max="10" value="1.5"></label>
         <label class="f">Print speed (1–6)<input id="speed" type="number" min="1" max="6" value="4"></label>
-        <label class="f">Send chunk (bytes)<input id="chunk" type="number" min="20" max="512" value="180"></label>
-        <label class="f">Pause per chunk (ms)<input id="delay" type="number" min="0" max="100" value="4"></label>
+        <label class="f">Send chunk (bytes)<input id="chunk" type="number" min="20" max="512" value="100"></label>
+        <label class="f">Pause per chunk (ms)<input id="delay" type="number" min="0" max="100" value="6"></label>
         <label class="f">Head width (dots)<input id="headDots" type="number" min="384" max="864" value="832"></label>
       </div>
       <div class="row" style="margin-top:10px">
@@ -251,8 +251,8 @@ let nextId = 1;
 
 /* ---------- settings ---------- */
 const S_IDS = ['size','copies','cw','ch','density','thresh','mode','fit','autorot','trim','proto','gap','gapmm','margin','speed','chunk','delay','headDots','flip','invert','detect'];
-function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set4')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
-function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set4',JSON.stringify(s)); }catch(e){} }
+function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set5')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
+function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set5',JSON.stringify(s)); }catch(e){} }
 function num(id,d){ const v=parseFloat($(id).value); return isFinite(v)?v:d; }
 function cfg(){
   let w,h; const sz=$('size').value;
@@ -510,7 +510,7 @@ async function findChannel(gatt){
       if(p.write||p.writeWithoutResponse) cands.push(ch); } }
   const score=ch=>{ const u=ch.uuid.toLowerCase(); const i=PREFER.findIndex(k=>u.includes(k)); return i<0?99:i; };
   cands.sort((a,b)=>score(a)-score(b)); allChars=cands;
-  let saved=null; try{ saved=localStorage.getItem('d520char'); }catch(e){}
+  let saved=null; try{ saved=localStorage.getItem('d520char5'); }catch(e){}
   const pick=saved&&cands.find(c=>c.uuid===saved); if(pick) log('Using saved channel '+saved);
   return pick||cands[0]||null;
 }
@@ -530,7 +530,7 @@ $('connectBtn').onclick=async()=>{
     if(!wchar) throw new Error('Connected to '+(dev.name||'the printer')+' but found no print channel. Turn the printer off and on, make sure no other app is connected to it, then tap Connect again. Open "Connection log" under Printer & advanced and send a screenshot if it still fails.');
     noResp=!!wchar.properties.writeWithoutResponse;
     log('Using '+wchar.uuid+(noResp?' (fast)':' (with response)'));
-    chip('on',(dev.name||'Printer')+' connected'); $('finder').hidden=false;
+    chip('on',(dev.name||'Printer')+' connected');
   }catch(e){
     log('Connect failed: '+e.name+' '+e.message);
     if(e.name==='NotFoundError'&&/cancel/i.test(e.message)){ chip('','Not connected'); return; }
@@ -542,12 +542,11 @@ async function sendBytes(bytes,onProg,opt){
   const C=Object.assign(cfg(),opt||{}), cs=Math.max(20,C.chunk);
   for(let i=0;i<bytes.length;i+=cs){
     const part=bytes.subarray(i,Math.min(bytes.length,i+cs));
-    const n=i/cs, barrier=noResp&&wchar.properties.write&&wchar.writeValueWithResponse&&(n%12===11);
+    const timed=pr=>Promise.race([pr,new Promise((_,rej)=>setTimeout(()=>rej(new Error('The printer stopped answering')),4000))]);
     for(let tries=0;;tries++){
-      try{ if(barrier) await wchar.writeValueWithResponse(part);
-           else if(noResp&&wchar.writeValueWithoutResponse) await wchar.writeValueWithoutResponse(part);
-           else if(wchar.writeValueWithResponse) await wchar.writeValueWithResponse(part); else await wchar.writeValue(part); break; }
-      catch(e){ if(tries>6) throw e; await sleep(60*(tries+1)); }
+      try{ if(noResp&&wchar.writeValueWithoutResponse) await timed(wchar.writeValueWithoutResponse(part));
+           else if(wchar.writeValueWithResponse) await timed(wchar.writeValueWithResponse(part)); else await timed(wchar.writeValue(part)); break; }
+      catch(e){ if(tries>3) throw e; log('write retry: '+e.message); await sleep(80*(tries+1)); }
     }
     if(C.delay) await sleep(C.delay);
     onProg&&onProg(Math.min(bytes.length,i+cs));
@@ -641,7 +640,7 @@ $('findBtn').onclick=async()=>{
     const p=findPlan[i]; $('fl'+i).style.fontWeight='700'; setSum(`Sending test <b>${i+1}</b> of <b>${findPlan.length}</b>…`,true);
     const prevC=wchar, prevN=noResp; wchar=p.ch; noResp=!!p.ch.properties.writeWithoutResponse;
     try{ const out=numberLabel(i+1,C); const job=buildJob(out,1,{...C,proto:p.proto});
-      await sendBytes(job,null,{chunk:180,delay:4}); log('Test '+(i+1)+' sent: '+p.proto+' '+p.ch.uuid); }
+      await sendBytes(job,null,{chunk:100,delay:6}); log('Test '+(i+1)+' sent: '+p.proto+' '+p.ch.uuid); }
     catch(e){ log('Test '+(i+1)+' failed: '+e.message); $('fl'+i).textContent+=' (send failed)'; }
     wchar=prevC; noResp=prevN; $('fl'+i).style.fontWeight='';
     await sleep(1800);
@@ -651,8 +650,8 @@ $('findBtn').onclick=async()=>{
 $('findSave').onclick=()=>{
   const n=Math.round(num('findNum',0)); const p=findPlan[n-1]; if(!p){ setSum('Type a number from the list.'); return; }
   $('proto').value=p.proto; wchar=p.ch; noResp=!!p.ch.properties.writeWithoutResponse;
-  try{ localStorage.setItem('d520char',p.ch.uuid); }catch(e){} saveSettings();
-  $('chunk').value=180; $('delay').value=4; saveSettings();
+  try{ localStorage.setItem('d520char5',p.ch.uuid); }catch(e){} saveSettings();
+  $('chunk').value=100; $('delay').value=6; saveSettings();
   setSum(`Saved. Using setting <b>${n}</b>. Tap Print.`,true); $('findPick').hidden=true; renderAll();
 };
 $('findNone').onclick=()=>{ showErr('Nothing printed with any setting. Open Printer & advanced, scroll to Connection log, and send Claude a screenshot of it.'); $('findPick').hidden=true; };
