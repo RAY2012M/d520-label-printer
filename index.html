@@ -89,6 +89,17 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
   </div>
 
   <div class="notice" id="btErr" role="alert" hidden></div>
+  <section class="panel" id="finder" hidden>
+    <h2>Find the setting your D520 understands</h2>
+    <p class="hint" style="margin:0">Connected, but nothing printed? Tap the button. The printer gets a few short test labels, each printed with a different setting and a big number on it. Then type the number that came out.</p>
+    <div class="row"><button id="findBtn" class="primary">Send numbered tests</button></div>
+    <ol id="findList" class="hint" style="margin:0;padding-left:20px"></ol>
+    <div class="row" id="findPick" hidden>
+      <label class="f" style="flex:1 1 140px">Number that printed<input id="findNum" type="number" min="1" inputmode="numeric"></label>
+      <button id="findSave" class="primary">Use this setting</button>
+      <button id="findNone">Nothing printed</button>
+    </div>
+  </section>
   <div class="notice" id="noBt" hidden>
     <b>Bluetooth isn't available in this browser.</b> On iPhone, Safari can't talk to Bluetooth printers. Install the free <b>Bluefy – Web BLE Browser</b> app from the App Store and open this same page inside Bluefy. Turn the Labelife/other printer app off first, since the printer accepts one phone at a time.
   </div>
@@ -173,6 +184,7 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
           <select id="proto">
             <option value="tspl">TSPL (D520, PM-241, most 4×6)</option>
             <option value="escpos">ESC/POS raster</option>
+            <option value="phomemo">Phomemo ESC/POS</option>
           </select>
         </label>
         <label class="f">Paper type
@@ -185,8 +197,8 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
         <label class="f">Gap between labels (mm)<input id="gapmm" type="number" step="0.5" min="0" max="10" value="3"></label>
         <label class="f">Margin inside label (mm)<input id="margin" type="number" step="0.5" min="0" max="10" value="1.5"></label>
         <label class="f">Print speed (1–6)<input id="speed" type="number" min="1" max="6" value="4"></label>
-        <label class="f">Send chunk (bytes)<input id="chunk" type="number" min="20" max="512" value="180"></label>
-        <label class="f">Pause per chunk (ms)<input id="delay" type="number" min="0" max="100" value="12"></label>
+        <label class="f">Send chunk (bytes)<input id="chunk" type="number" min="20" max="512" value="100"></label>
+        <label class="f">Pause per chunk (ms)<input id="delay" type="number" min="0" max="100" value="25"></label>
         <label class="f">Head width (dots)<input id="headDots" type="number" min="384" max="864" value="832"></label>
       </div>
       <div class="row" style="margin-top:10px">
@@ -463,7 +475,7 @@ const SERVICE_LIST=[0xff00,0xffe0,0xfff0,0x18f0,0xae30,0xae00,0xffb0,0xfee7,0xff
   '49535343-fe7d-4ae5-8fa9-9fafd205e455','e7810a71-73ae-499d-8c15-faa9aef0c3f2','6e400001-b5a3-f393-e0a9-e50e24dcca9e'];
 const SERVICES=(()=>{ const out=[]; for(const s of SERVICE_LIST){ try{ const u=(window.BluetoothUUID&&BluetoothUUID.getService)?BluetoothUUID.getService(s):s; if(!out.includes(u)) out.push(u);}catch(e){} } return out; })();
 const PREFER=['ff02','ffe1','fff2','ff01','ae01','2af1','49535343-8841','6e400002','bef8d6c9','fff1','ffe9'];
-let dev=null, wchar=null, noResp=false;
+let dev=null, wchar=null, noResp=false, allChars=[];
 const hasBt=!!(navigator.bluetooth&&navigator.bluetooth.requestDevice);
 let framed=false; try{ framed=window.top!==window.self; }catch(e){ framed=true; }
 if(!hasBt){ $('noBt').hidden=false; }
@@ -497,7 +509,10 @@ async function findChannel(gatt){
       if(p.notify||p.indicate){ try{ await ch.startNotifications(); ch.addEventListener('characteristicvaluechanged',ev=>{ const v=new Uint8Array(ev.target.value.buffer); log('printer says: '+[...v].map(b=>b.toString(16).padStart(2,'0')).join(' ')); }); }catch(e){} }
       if(p.write||p.writeWithoutResponse) cands.push(ch); } }
   const score=ch=>{ const u=ch.uuid.toLowerCase(); const i=PREFER.findIndex(k=>u.includes(k)); return i<0?99:i; };
-  cands.sort((a,b)=>score(a)-score(b)); return cands[0]||null;
+  cands.sort((a,b)=>score(a)-score(b)); allChars=cands;
+  let saved=null; try{ saved=localStorage.getItem('d520char'); }catch(e){}
+  const pick=saved&&cands.find(c=>c.uuid===saved); if(pick) log('Using saved channel '+saved);
+  return pick||cands[0]||null;
 }
 $('connectBtn').onclick=async()=>{
   if(dev&&dev.gatt&&dev.gatt.connected){ dev.gatt.disconnect(); return; }
@@ -515,7 +530,7 @@ $('connectBtn').onclick=async()=>{
     if(!wchar) throw new Error('Connected to '+(dev.name||'the printer')+' but found no print channel. Turn the printer off and on, make sure no other app is connected to it, then tap Connect again. Open "Connection log" under Printer & advanced and send a screenshot if it still fails.');
     noResp=!!wchar.properties.writeWithoutResponse;
     log('Using '+wchar.uuid+(noResp?' (fast)':' (with response)'));
-    chip('on',(dev.name||'Printer')+' connected');
+    chip('on',(dev.name||'Printer')+' connected'); $('finder').hidden=false;
   }catch(e){
     log('Connect failed: '+e.name+' '+e.message);
     if(e.name==='NotFoundError'&&/cancel/i.test(e.message)){ chip('','Not connected'); return; }
@@ -523,8 +538,8 @@ $('connectBtn').onclick=async()=>{
     showErr((framed?'Bluetooth is blocked inside this frame. Open https://ray2012m.github.io/d520-label-printer/ in Bluefy. ':'')+'Could not connect: '+(e.message||e.name));
   }
 };
-async function sendBytes(bytes,onProg){
-  const C=cfg(), cs=Math.max(20,C.chunk);
+async function sendBytes(bytes,onProg,opt){
+  const C=Object.assign(cfg(),opt||{}), cs=Math.max(20,C.chunk);
   for(let i=0;i<bytes.length;i+=cs){
     const part=bytes.subarray(i,Math.min(bytes.length,i+cs));
     for(let tries=0;;tries++){
@@ -548,6 +563,14 @@ function buildJob(out,copies,C){
     head+=`DIRECTION ${C.flip?1:0},0\r\nREFERENCE 0,0\r\nDENSITY ${Math.round(C.density)}\r\nSPEED ${Math.round(C.speed)}\r\nCLS\r\n`;
     head+=`BITMAP 0,0,${out.bpr},${out.h},0,`;
     return concat([enc(head),data,enc(`\r\nPRINT 1,${copies}\r\n`)]);
+  }
+  if(C.proto==='phomemo'){
+    let bits=C.invert?out.bits.map(b=>(~b)&0xff):out.bits; const one=[];
+    one.push(new Uint8Array([0x1b,0x40,0x1b,0x61,0x01,0x1f,0x11,0x02,0x04]));
+    for(let y=0;y<out.h;y+=255){ const n=Math.min(255,out.h-y);
+      one.push(new Uint8Array([0x1d,0x76,0x30,0,out.bpr&0xff,out.bpr>>8,n&0xff,n>>8]), bits.subarray(y*out.bpr,(y+n)*out.bpr)); }
+    one.push(new Uint8Array([0x1b,0x64,0x02,0x1b,0x64,0x02,0x1f,0x11,0x08,0x1f,0x11,0x0e,0x1f,0x11,0x07,0x1f,0x11,0x09]));
+    const parts=[]; for(let c=0;c<copies;c++) parts.push(...one); return concat(parts);
   }
   // ESC/POS raster, printed in bands
   const parts=[new Uint8Array([0x1b,0x40])]; let rows=out.h, bits=out.bits;
@@ -582,6 +605,43 @@ $('testBtn').onclick=()=>{ const C=cfg(); const c=document.createElement('canvas
 $('feedBtn').onclick=async()=>{ if(!wchar){ await $('connectBtn').onclick(); if(!wchar) return; } const C=cfg();
   const mm=v=>(v*25.4).toFixed(1); const s=C.proto==='tspl'?`SIZE ${mm(C.w)} mm,${mm(C.h)} mm\r\nGAP ${C.gap==='cont'?0:C.gapmm} mm,0 mm\r\nFORMFEED\r\n`:'\x1b\x64\x08';
   try{ await sendBytes(enc(s)); log('Feed sent'); }catch(e){ log('Feed error '+e.message); } };
+
+/* ---------- find the working setting ---------- */
+let findPlan=[];
+function numberLabel(n,C){
+  const w=C.pw, h=260; const c=document.createElement('canvas'); c.width=w; c.height=h; const x=c.getContext('2d');
+  x.fillStyle='#fff'; x.fillRect(0,0,w,h); x.fillStyle='#000'; x.fillRect(0,0,w,14); x.fillRect(0,h-14,w,14);
+  x.font='bold 170px sans-serif'; x.textBaseline='middle'; x.fillText(String(n),30,h/2+8);
+  x.font='bold 46px sans-serif'; x.fillText('TEST '+n,w-300,h/2);
+  const L={src:{canvas:c,name:'t'},rect:{x:0,y:0,w,h},rot:0};
+  return renderLabel(L,{...C,pw:w,ph:h,trim:false,autorot:false,fit:'actual',margin:0});
+}
+$('findBtn').onclick=async()=>{
+  if(!wchar){ await $('connectBtn').onclick(); if(!wchar) return; }
+  const C=cfg(); const chars=allChars.slice(0,4); findPlan=[];
+  for(const ch of chars) for(const proto of ['tspl','phomemo','escpos']) findPlan.push({ch,proto});
+  const list=$('findList'); list.innerHTML='';
+  findPlan.forEach((p,i)=>{ const li=document.createElement('li'); li.textContent=(p.proto==='tspl'?'TSPL':p.proto==='phomemo'?'Phomemo ESC/POS':'ESC/POS')+' on channel '+p.ch.uuid.slice(4,8); li.id='fl'+i; list.appendChild(li); });
+  $('findBtn').disabled=true; $('findPick').hidden=true;
+  for(let i=0;i<findPlan.length;i++){
+    const p=findPlan[i]; $('fl'+i).style.fontWeight='700'; setSum(`Sending test <b>${i+1}</b> of <b>${findPlan.length}</b>…`,true);
+    const prevC=wchar, prevN=noResp; wchar=p.ch; noResp=!!p.ch.properties.writeWithoutResponse;
+    try{ const out=numberLabel(i+1,C); const job=buildJob(out,1,{...C,proto:p.proto});
+      await sendBytes(job,null,{chunk:100,delay:25}); log('Test '+(i+1)+' sent: '+p.proto+' '+p.ch.uuid); }
+    catch(e){ log('Test '+(i+1)+' failed: '+e.message); $('fl'+i).textContent+=' (send failed)'; }
+    wchar=prevC; noResp=prevN; $('fl'+i).style.fontWeight='';
+    await sleep(3000);
+  }
+  $('findBtn').disabled=false; $('findPick').hidden=false; setSum('Tests sent. Type the number that printed.');
+};
+$('findSave').onclick=()=>{
+  const n=Math.round(num('findNum',0)); const p=findPlan[n-1]; if(!p){ setSum('Type a number from the list.'); return; }
+  $('proto').value=p.proto; wchar=p.ch; noResp=!!p.ch.properties.writeWithoutResponse;
+  try{ localStorage.setItem('d520char',p.ch.uuid); }catch(e){} saveSettings();
+  $('chunk').value=100; $('delay').value=25; saveSettings();
+  setSum(`Saved. Using setting <b>${n}</b>. Tap Print.`,true); $('findPick').hidden=true; renderAll();
+};
+$('findNone').onclick=()=>{ showErr('Nothing printed with any setting. Open Printer & advanced, scroll to Connection log, and send Claude a screenshot of it.'); $('findPick').hidden=true; };
 
 /* ---------- sample so the queue isn't empty on first open ---------- */
 function sample(){
