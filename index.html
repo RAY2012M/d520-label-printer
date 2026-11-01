@@ -539,11 +539,18 @@ $('connectBtn').onclick=async()=>{
   }
 };
 async function sendBytes(bytes,onProg,opt){
-  const C=Object.assign(cfg(),opt||{}), cs=Math.max(20,C.chunk);
+  const C=Object.assign(cfg(),opt||{});
+  if(C.safe===undefined) C.safe=bytes.length>4000; // full labels: wait for the printer to take each piece so nothing gets lost
+  const ackOk=!!(wchar&&wchar.properties&&wchar.properties.write&&wchar.writeValueWithResponse);
+  if(C.safe&&!ackOk){ C.chunk=Math.min(C.chunk,100); C.delay=Math.max(C.delay,45); }
+  const cs=Math.max(20,C.safe&&ackOk?Math.max(C.chunk,180):C.chunk);
+  if(C.safe) log('Sending '+bytes.length+' bytes '+(ackOk?'with printer confirmation':'slowly')+', '+cs+' per piece');
   for(let i=0;i<bytes.length;i+=cs){
     const part=bytes.subarray(i,Math.min(bytes.length,i+cs));
     for(let tries=0;;tries++){
-      try{ if(noResp&&wchar.writeValueWithoutResponse) await wchar.writeValueWithoutResponse(part);
+      try{ const canAck=wchar.properties&&wchar.properties.write&&wchar.writeValueWithResponse;
+           if(C.safe&&canAck) await wchar.writeValueWithResponse(part);
+           else if(noResp&&wchar.writeValueWithoutResponse) await wchar.writeValueWithoutResponse(part);
            else if(wchar.writeValueWithResponse) await wchar.writeValueWithResponse(part); else await wchar.writeValue(part); break; }
       catch(e){ if(tries>6) throw e; await sleep(60*(tries+1)); }
     }
@@ -589,7 +596,7 @@ async function printList(items){
   try{
     const jobs=items.map(it=>buildJob(it.out,it.copies,C)); const total=jobs.reduce((a,j)=>a+j.length,0); let done=0;
     for(let k=0;k<jobs.length;k++){ setSum(`Printing label <b>${k+1}</b> of <b>${jobs.length}</b>…`,true);
-      await sendBytes(jobs[k],n=>{ $('progBar').style.width=((done+n)/total*100).toFixed(1)+'%'; }); done+=jobs[k].length; await sleep(250); }
+      await sendBytes(jobs[k],n=>{ $('progBar').style.width=((done+n)/total*100).toFixed(1)+'%'; }); done+=jobs[k].length; log('Label '+(k+1)+' sent ('+jobs[k].length+' bytes)'); await sleep(2500); }
     log('Sent '+jobs.length+' label job(s), '+total+' bytes'); setSum(`Sent <b>${jobs.length}</b> label${jobs.length===1?'':'s'} to the printer`,true);
   }catch(e){ log('Print error: '+e.message); setSum('Print stopped: '+e.message+'. Reconnect and try again.'); }
   finally{ $('printBtn').disabled=false; setTimeout(()=>$('progBar').style.width='0',1500); }
