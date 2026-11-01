@@ -197,8 +197,8 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
         <label class="f">Gap between labels (mm)<input id="gapmm" type="number" step="0.5" min="0" max="10" value="3"></label>
         <label class="f">Margin inside label (mm)<input id="margin" type="number" step="0.5" min="0" max="10" value="1.5"></label>
         <label class="f">Print speed (1–6)<input id="speed" type="number" min="1" max="6" value="4"></label>
-        <label class="f">Send chunk (bytes)<input id="chunk" type="number" min="20" max="512" value="100"></label>
-        <label class="f">Pause per chunk (ms)<input id="delay" type="number" min="0" max="100" value="25"></label>
+        <label class="f">Send chunk (bytes)<input id="chunk" type="number" min="20" max="512" value="180"></label>
+        <label class="f">Pause per chunk (ms)<input id="delay" type="number" min="0" max="100" value="4"></label>
         <label class="f">Head width (dots)<input id="headDots" type="number" min="384" max="864" value="832"></label>
       </div>
       <div class="row" style="margin-top:10px">
@@ -251,8 +251,8 @@ let nextId = 1;
 
 /* ---------- settings ---------- */
 const S_IDS = ['size','copies','cw','ch','density','thresh','mode','fit','autorot','trim','proto','gap','gapmm','margin','speed','chunk','delay','headDots','flip','invert','detect'];
-function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
-function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set',JSON.stringify(s)); }catch(e){} }
+function loadSettings(){ try{ const s=JSON.parse(localStorage.getItem('d520set4')||'{}'); for(const k of S_IDS){ if(s[k]===undefined) continue; const el=$(k); if(el.type==='checkbox') el.checked=s[k]; else el.value=s[k]; } }catch(e){} }
+function saveSettings(){ try{ const s={}; for(const k of S_IDS){ const el=$(k); s[k]=el.type==='checkbox'?el.checked:el.value; } localStorage.setItem('d520set4',JSON.stringify(s)); }catch(e){} }
 function num(id,d){ const v=parseFloat($(id).value); return isFinite(v)?v:d; }
 function cfg(){
   let w,h; const sz=$('size').value;
@@ -424,7 +424,7 @@ function renderAll(){
     card.appendChild(t); box.appendChild(card);
   });
   const act=labels.filter(l=>l.on), total=act.reduce((a,l)=>a+l.copies,0);
-  $('queueInfo').textContent=labels.length?`${C.w}×${C.h} in · ${C.pw}×${C.ph} dots`:'';
+  $('queueInfo').textContent=labels.length?`${C.w}×${C.h} in · ${C.proto==='tspl'?'TSPL':C.proto==='phomemo'?'Phomemo':'ESC/POS'}`:'';
   setSum(`<b>${act.length}</b> label${act.length===1?'':'s'} · <b>${total}</b> to print`,true);
 }
 function setSum(t,html){ if(html) $('sumText').innerHTML=t; else $('sumText').textContent=t; }
@@ -539,17 +539,12 @@ $('connectBtn').onclick=async()=>{
   }
 };
 async function sendBytes(bytes,onProg,opt){
-  const C=Object.assign(cfg(),opt||{});
-  if(C.safe===undefined) C.safe=bytes.length>4000; // full labels: wait for the printer to take each piece so nothing gets lost
-  const ackOk=!!(wchar&&wchar.properties&&wchar.properties.write&&wchar.writeValueWithResponse);
-  if(C.safe&&!ackOk){ C.chunk=Math.min(C.chunk,100); C.delay=Math.max(C.delay,45); }
-  const cs=Math.max(20,C.safe&&ackOk?Math.max(C.chunk,180):C.chunk);
-  if(C.safe) log('Sending '+bytes.length+' bytes '+(ackOk?'with printer confirmation':'slowly')+', '+cs+' per piece');
+  const C=Object.assign(cfg(),opt||{}), cs=Math.max(20,C.chunk);
   for(let i=0;i<bytes.length;i+=cs){
     const part=bytes.subarray(i,Math.min(bytes.length,i+cs));
+    const n=i/cs, barrier=noResp&&wchar.properties.write&&wchar.writeValueWithResponse&&(n%12===11);
     for(let tries=0;;tries++){
-      try{ const canAck=wchar.properties&&wchar.properties.write&&wchar.writeValueWithResponse;
-           if(C.safe&&canAck) await wchar.writeValueWithResponse(part);
+      try{ if(barrier) await wchar.writeValueWithResponse(part);
            else if(noResp&&wchar.writeValueWithoutResponse) await wchar.writeValueWithoutResponse(part);
            else if(wchar.writeValueWithResponse) await wchar.writeValueWithResponse(part); else await wchar.writeValue(part); break; }
       catch(e){ if(tries>6) throw e; await sleep(60*(tries+1)); }
@@ -568,8 +563,20 @@ function buildJob(out,copies,C){
     let head=`SIZE ${mm(C.w)} mm,${mm(C.h)} mm\r\n`;
     head+= C.gap==='cont'?'GAP 0 mm,0 mm\r\n': C.gap==='mark'?`BLINE ${C.gapmm} mm,0 mm\r\n`:`GAP ${C.gapmm} mm,0 mm\r\n`;
     head+=`DIRECTION ${C.flip?1:0},0\r\nREFERENCE 0,0\r\nDENSITY ${Math.round(C.density)}\r\nSPEED ${Math.round(C.speed)}\r\nCLS\r\n`;
-    head+=`BITMAP 0,0,${out.bpr},${out.h},0,`;
-    return concat([enc(head),data,enc(`\r\nPRINT 1,${copies}\r\n`)]);
+    if(C.invert){ head+=`BITMAP 0,0,${out.bpr},${out.h},0,`; return concat([enc(head),data,enc(`\r\nPRINT 1,${copies}\r\n`)]); }
+    // Send only the parts of the label that have ink: blank rows are skipped, each block is cropped left/right.
+    const parts=[enc(head)], bpr=out.bpr, B=16; let y=0;
+    const bandInk=y0=>{ let l=bpr,r=-1; const y1=Math.min(out.h,y0+B); for(let yy=y0;yy<y1;yy++){ const o=yy*bpr; for(let xb=0;xb<bpr;xb++) if(out.bits[o+xb]){ if(xb<l)l=xb; if(xb>r)r=xb; } } return r<0?null:[l,r]; };
+    while(y<out.h){
+      let ink=bandInk(y); if(!ink){ y+=B; continue; }
+      let y0=y,l=ink[0],r=ink[1]; y+=B;
+      while(y<out.h){ const k=bandInk(y); if(!k) break; l=Math.min(l,k[0]); r=Math.max(r,k[1]); y+=B; if(y-y0>=512) break; }
+      const y1=Math.min(out.h,y), wb=r-l+1, hh=y1-y0, blk=new Uint8Array(wb*hh);
+      for(let yy=0;yy<hh;yy++) blk.set(data.subarray((y0+yy)*bpr+l,(y0+yy)*bpr+r+1),yy*wb);
+      parts.push(enc(`BITMAP ${l*8},${y0},${wb},${hh},0,`),blk,enc('\r\n'));
+    }
+    parts.push(enc(`PRINT 1,${copies}\r\n`));
+    return concat(parts);
   }
   if(C.proto==='phomemo'){
     let bits=C.invert?out.bits.map(b=>(~b)&0xff):out.bits; const one=[];
@@ -596,7 +603,7 @@ async function printList(items){
   try{
     const jobs=items.map(it=>buildJob(it.out,it.copies,C)); const total=jobs.reduce((a,j)=>a+j.length,0); let done=0;
     for(let k=0;k<jobs.length;k++){ setSum(`Printing label <b>${k+1}</b> of <b>${jobs.length}</b>…`,true);
-      await sendBytes(jobs[k],n=>{ $('progBar').style.width=((done+n)/total*100).toFixed(1)+'%'; }); done+=jobs[k].length; log('Label '+(k+1)+' sent ('+jobs[k].length+' bytes)'); await sleep(2500); }
+      await sendBytes(jobs[k],n=>{ $('progBar').style.width=((done+n)/total*100).toFixed(1)+'%'; }); done+=jobs[k].length; await sleep(250); }
     log('Sent '+jobs.length+' label job(s), '+total+' bytes'); setSum(`Sent <b>${jobs.length}</b> label${jobs.length===1?'':'s'} to the printer`,true);
   }catch(e){ log('Print error: '+e.message); setSum('Print stopped: '+e.message+'. Reconnect and try again.'); }
   finally{ $('printBtn').disabled=false; setTimeout(()=>$('progBar').style.width='0',1500); }
@@ -625,7 +632,7 @@ function numberLabel(n,C){
 }
 $('findBtn').onclick=async()=>{
   if(!wchar){ await $('connectBtn').onclick(); if(!wchar) return; }
-  const C=cfg(); const chars=allChars.slice(0,4); findPlan=[];
+  const C=cfg(); const chars=[wchar,...allChars.filter(c=>c!==wchar)].slice(0,2); findPlan=[];
   for(const ch of chars) for(const proto of ['tspl','phomemo','escpos']) findPlan.push({ch,proto});
   const list=$('findList'); list.innerHTML='';
   findPlan.forEach((p,i)=>{ const li=document.createElement('li'); li.textContent=(p.proto==='tspl'?'TSPL':p.proto==='phomemo'?'Phomemo ESC/POS':'ESC/POS')+' on channel '+p.ch.uuid.slice(4,8); li.id='fl'+i; list.appendChild(li); });
@@ -634,10 +641,10 @@ $('findBtn').onclick=async()=>{
     const p=findPlan[i]; $('fl'+i).style.fontWeight='700'; setSum(`Sending test <b>${i+1}</b> of <b>${findPlan.length}</b>…`,true);
     const prevC=wchar, prevN=noResp; wchar=p.ch; noResp=!!p.ch.properties.writeWithoutResponse;
     try{ const out=numberLabel(i+1,C); const job=buildJob(out,1,{...C,proto:p.proto});
-      await sendBytes(job,null,{chunk:100,delay:25}); log('Test '+(i+1)+' sent: '+p.proto+' '+p.ch.uuid); }
+      await sendBytes(job,null,{chunk:180,delay:4}); log('Test '+(i+1)+' sent: '+p.proto+' '+p.ch.uuid); }
     catch(e){ log('Test '+(i+1)+' failed: '+e.message); $('fl'+i).textContent+=' (send failed)'; }
     wchar=prevC; noResp=prevN; $('fl'+i).style.fontWeight='';
-    await sleep(3000);
+    await sleep(1800);
   }
   $('findBtn').disabled=false; $('findPick').hidden=false; setSum('Tests sent. Type the number that printed.');
 };
@@ -645,7 +652,7 @@ $('findSave').onclick=()=>{
   const n=Math.round(num('findNum',0)); const p=findPlan[n-1]; if(!p){ setSum('Type a number from the list.'); return; }
   $('proto').value=p.proto; wchar=p.ch; noResp=!!p.ch.properties.writeWithoutResponse;
   try{ localStorage.setItem('d520char',p.ch.uuid); }catch(e){} saveSettings();
-  $('chunk').value=100; $('delay').value=25; saveSettings();
+  $('chunk').value=180; $('delay').value=4; saveSettings();
   setSum(`Saved. Using setting <b>${n}</b>. Tap Print.`,true); $('findPick').hidden=true; renderAll();
 };
 $('findNone').onclick=()=>{ showErr('Nothing printed with any setting. Open Printer & advanced, scroll to Connection log, and send Claude a screenshot of it.'); $('findPick').hidden=true; };
