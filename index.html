@@ -923,13 +923,10 @@ async function sendBytes(bytes,onProg,opt){
     if(stopFlag) throw new Error('Stopped');
     if(mode==='credits'){
       const tw=performance.now();
-      while(!(credits[svc]>0)){
-        if(stopFlag) throw new Error('Stopped');
-        if(performance.now()-tw>15000) throw new Error(`The printer stopped asking for data after ${used} packets`);
-        await new Promise(r=>{ creditWake=r; setTimeout(r,20); });
-      }
+      while(!(credits[svc]>0)&&performance.now()-tw<600){ if(stopFlag) throw new Error('Stopped'); await new Promise(r=>{ creditWake=r; setTimeout(r,20); }); }
       const waited=performance.now()-tw; if(waited>maxWait) maxWait=waited;
-      credits[svc]--; used++;
+      if(credits[svc]>0){ credits[svc]--; used++; }
+      else { mode='timed'; log(`No more credits after ${used} packets; sending the rest at a steady pace`); }
     }
     const part=bytes.subarray(i,Math.min(bytes.length,i+cs));
     for(let tries=0;;tries++){ try{ await timed(writeOne(part)); break; }
@@ -1101,7 +1098,7 @@ function lzo1xCompress(src){
 
 
 /* ---------- problem report ---------- */
-const APP_VERSION='21';
+const APP_VERSION='22';
 let lastPrint=null;
 function describeJob(job){
   // List every command in the job; image data is summarised by its size.
@@ -1244,7 +1241,7 @@ function removeSample(){ labels=labels.filter(l=>!l.src.sample); for(let i=sourc
 
 loadSettings(); $('customRow').hidden=$('size').value!=='custom'; $('densityOut').textContent=$('density').value; $('threshOut').textContent=$('thresh').value;
 sample(); renderAll();
-log('App version 21 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
+log('App version 22 · '+(hasBt?'Bluetooth ready':'Bluetooth not available in this browser'));
 setTimeout(autoConnect,2400);
 })();
 </script>
