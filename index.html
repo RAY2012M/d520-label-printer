@@ -88,6 +88,7 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
     </div>
   </div>
 
+  <div class="notice" id="btErr" role="alert" hidden></div>
   <div class="notice" id="noBt" hidden>
     <b>Bluetooth isn't available in this browser.</b> On iPhone, Safari can't talk to Bluetooth printers. Install the free <b>Bluefy – Web BLE Browser</b> app from the App Store and open this same page inside Bluefy. Turn the Labelife/other printer app off first, since the printer accepts one phone at a time.
   </div>
@@ -197,7 +198,7 @@ summary{cursor:pointer;font-weight:600;font-size:14px}
         <button id="feedBtn">Feed one label</button>
       </div>
       <p class="hint">If the test label prints garbage, switch Printer language to ESC/POS. If it prints solid black, tick Invert.</p>
-      <details>
+      <details open>
         <summary>Connection log</summary>
         <pre id="log"></pre>
       </details>
@@ -457,41 +458,71 @@ $('edSave').onclick=()=>{ ed.L.rect={...ed.r}; $('modal').hidden=true; ed=null; 
 $('edDup').onclick=()=>{ const L=ed.L; labels.splice(labels.indexOf(L)+1,0,{id:nextId++,src:L.src,rect:{...ed.r},rot:0,copies:L.copies,on:true,out:null}); $('modal').hidden=true; ed=null; renderAll(); };
 
 /* ---------- Bluetooth ---------- */
-const SERVICES=[0xff00,0xffe0,0xfff0,0x18f0,0xae30,0xae00,0xffb0,0xfee7,0xff80,0xfef0,
-  '49535343-fe7d-4ae5-8fa9-9fafd205e455','e7810a71-73ae-499d-8c15-faa9aef0c3f2','6e400001-b5a3-f393-e0a9-e50e24dcca9e',
-  '0000ff12-0000-1000-8000-00805f9b34fb','000018f0-0000-1000-8000-00805f9b34fb'];
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const SERVICE_LIST=[0xff00,0xffe0,0xfff0,0x18f0,0xae30,0xae00,0xffb0,0xfee7,0xff80,
+  '49535343-fe7d-4ae5-8fa9-9fafd205e455','e7810a71-73ae-499d-8c15-faa9aef0c3f2','6e400001-b5a3-f393-e0a9-e50e24dcca9e'];
+const SERVICES=(()=>{ const out=[]; for(const s of SERVICE_LIST){ try{ const u=(window.BluetoothUUID&&BluetoothUUID.getService)?BluetoothUUID.getService(s):s; if(!out.includes(u)) out.push(u);}catch(e){} } return out; })();
 const PREFER=['ff02','ffe1','fff2','ff01','ae01','2af1','49535343-8841','6e400002','bef8d6c9','fff1','ffe9'];
 let dev=null, wchar=null, noResp=false;
 const hasBt=!!(navigator.bluetooth&&navigator.bluetooth.requestDevice);
 let framed=false; try{ framed=window.top!==window.self; }catch(e){ framed=true; }
 if(!hasBt){ $('noBt').hidden=false; }
 function chip(state,txt){ const c=$('chip'); c.className='chip '+(state||''); $('chipText').textContent=txt; $('connectBtn').textContent=state==='on'?'Disconnect':'Connect printer'; }
+function showErr(msg){ const b=$('btErr'); if(!msg){ b.hidden=true; return; } b.textContent=msg; b.hidden=false; }
+async function pickDevice(){
+  // Several ways to ask for the device: some iPhone browsers reject one style and accept another.
+  const tries=[
+    {acceptAllDevices:true,optionalServices:SERVICES},
+    {filters:[{namePrefix:'D5'},{namePrefix:'D4'},{namePrefix:'PM'},{namePrefix:'Phomemo'},{namePrefix:'Q'},{namePrefix:'T'},{namePrefix:'P'},{namePrefix:'M'}],optionalServices:SERVICES},
+    {acceptAllDevices:true,optionalServices:SERVICES.slice(0,4)},
+    {acceptAllDevices:true}
+  ];
+  let last;
+  for(let i=0;i<tries.length;i++){
+    const t0=Date.now();
+    try{ log('Asking for device, way '+(i+1)); return await navigator.bluetooth.requestDevice(tries[i]); }
+    catch(e){ last=e; log('Way '+(i+1)+' failed: '+e.name+' '+e.message);
+      if(e.name==='NotFoundError' && Date.now()-t0>1500) throw e; // the list was shown and the person closed it
+    }
+  }
+  throw last;
+}
+async function findChannel(gatt){
+  let services=[];
+  try{ services=await gatt.getPrimaryServices(); log('Found '+services.length+' services'); }catch(e){ log('getPrimaryServices: '+e.name+' '+e.message); }
+  if(!services.length){ for(const s of SERVICES){ try{ services.push(await gatt.getPrimaryService(s)); }catch(e){} } log('Found '+services.length+' services one by one'); }
+  const cands=[];
+  for(const sv of services){ let chars=[]; try{ chars=await sv.getCharacteristics(); }catch(e){ log('chars '+sv.uuid+': '+e.message); }
+    for(const ch of chars){ const p=ch.properties; log(`svc ${sv.uuid} chr ${ch.uuid} w:${p.write} wnr:${p.writeWithoutResponse} n:${p.notify}`);
+      if(p.notify||p.indicate){ try{ await ch.startNotifications(); ch.addEventListener('characteristicvaluechanged',ev=>{ const v=new Uint8Array(ev.target.value.buffer); log('printer says: '+[...v].map(b=>b.toString(16).padStart(2,'0')).join(' ')); }); }catch(e){} }
+      if(p.write||p.writeWithoutResponse) cands.push(ch); } }
+  const score=ch=>{ const u=ch.uuid.toLowerCase(); const i=PREFER.findIndex(k=>u.includes(k)); return i<0?99:i; };
+  cands.sort((a,b)=>score(a)-score(b)); return cands[0]||null;
+}
 $('connectBtn').onclick=async()=>{
-  if(dev&&dev.gatt.connected){ dev.gatt.disconnect(); return; }
+  if(dev&&dev.gatt&&dev.gatt.connected){ dev.gatt.disconnect(); return; }
   if(!hasBt){ $('noBt').hidden=false; $('noBt').scrollIntoView({behavior:'smooth'}); return; }
+  showErr('');
   try{
+    if(navigator.bluetooth.getAvailability){ try{ const ok=await navigator.bluetooth.getAvailability(); log('Bluetooth available: '+ok); if(ok===false) throw Object.assign(new Error('Bluetooth is off, or this browser is not allowed to use it. iPhone Settings > Bluefy > turn on Bluetooth, and make sure Bluetooth is on in Control Center.'),{name:'Unavailable'}); }catch(e){ if(e.name==='Unavailable') throw e; } }
     chip('busy','Choose your D520…');
-    const slow=setTimeout(()=>{ if(!dev||!dev.gatt||!dev.gatt.connected){ chip('','No printer list appeared'); setSum(framed?'This copy runs inside a frame that blocks Bluetooth. Open the direct link in Bluefy instead.':'No Bluetooth list appeared. Turn Bluetooth on, allow Bluefy to use Bluetooth in iPhone Settings, then tap Connect again.'); } },9000);
-    try{ dev=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:SERVICES}); } finally { clearTimeout(slow); }
+    dev=await pickDevice();
+    log('Picked: '+(dev.name||'(no name)')+' '+(dev.id||''));
     dev.addEventListener('gattserverdisconnected',()=>{ wchar=null; chip('','Not connected'); log('Disconnected'); });
     chip('busy','Connecting to '+(dev.name||'printer')+'…');
-    const gatt=await dev.gatt.connect();
-    let services=[]; try{ services=await gatt.getPrimaryServices(); }catch(e){ log('getPrimaryServices: '+e.message); }
-    const cands=[];
-    for(const sv of services){ let chars=[]; try{ chars=await sv.getCharacteristics(); }catch(e){}
-      for(const ch of chars){ const p=ch.properties; log(`svc ${sv.uuid.slice(4,8)} chr ${ch.uuid} w:${p.write} wnr:${p.writeWithoutResponse} n:${p.notify}`);
-        if(p.notify||p.indicate){ try{ await ch.startNotifications(); ch.addEventListener('characteristicvaluechanged',ev=>{ const v=new Uint8Array(ev.target.value.buffer); log('printer says: '+[...v].map(b=>b.toString(16).padStart(2,'0')).join(' ')+'  '+String.fromCharCode(...v.filter(b=>b>31&&b<127))); }); }catch(e){} }
-        if(p.write||p.writeWithoutResponse) cands.push(ch); } }
-    if(!cands.length) throw new Error('Connected, but this printer exposes no writable channel. Close the other label app, turn the printer off and on, and try again.');
-    const score=ch=>{ const u=ch.uuid.toLowerCase(); const i=PREFER.findIndex(k=>u.includes(k)); return i<0?99:i; };
-    cands.sort((a,b)=>score(a)-score(b)); wchar=cands[0]; noResp=wchar.properties.writeWithoutResponse;
+    let gatt; for(let k=0;k<3;k++){ try{ gatt=await dev.gatt.connect(); break; }catch(e){ log('connect try '+(k+1)+': '+e.message); if(k===2) throw e; await sleep(800); } }
+    wchar=await findChannel(gatt);
+    if(!wchar) throw new Error('Connected to '+(dev.name||'the printer')+' but found no print channel. Turn the printer off and on, make sure no other app is connected to it, then tap Connect again. Open "Connection log" under Printer & advanced and send a screenshot if it still fails.');
+    noResp=!!wchar.properties.writeWithoutResponse;
     log('Using '+wchar.uuid+(noResp?' (fast)':' (with response)'));
     chip('on',(dev.name||'Printer')+' connected');
-  }catch(e){ log('Connect failed: '+e.name+' '+e.message); chip('', e.name==='NotFoundError'?'Not connected':'Connect failed');
-    if(e.name==='SecurityError'||framed) setSum('Bluetooth is blocked on this copy of the page. Open the direct link in Bluefy.');
-    else if(e.name!=='NotFoundError') setSum(e.message); }
+  }catch(e){
+    log('Connect failed: '+e.name+' '+e.message);
+    if(e.name==='NotFoundError'&&/cancel/i.test(e.message)){ chip('','Not connected'); return; }
+    chip('','Connect failed');
+    showErr((framed?'Bluetooth is blocked inside this frame. Open https://ray2012m.github.io/d520-label-printer/ in Bluefy. ':'')+'Could not connect: '+(e.message||e.name));
+  }
 };
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 async function sendBytes(bytes,onProg){
   const C=cfg(), cs=Math.max(20,C.chunk);
   for(let i=0;i<bytes.length;i+=cs){
